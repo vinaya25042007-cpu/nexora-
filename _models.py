@@ -1,785 +1,1277 @@
 from __future__ import annotations
 
-import os
-import inspect
-from typing import TYPE_CHECKING, Any, Type, Union, Generic, TypeVar, Callable, cast
-from datetime import date, datetime
-from typing_extensions import (
-    Unpack,
-    Literal,
-    ClassVar,
-    Protocol,
-    Required,
-    ParamSpec,
-    TypedDict,
-    TypeGuard,
-    final,
-    override,
-    runtime_checkable,
+import codecs
+import datetime
+import email.message
+import json as jsonlib
+import re
+import typing
+import urllib.request
+from collections.abc import Mapping
+from http.cookiejar import Cookie, CookieJar
+
+from ._content import ByteStream, UnattachedStream, encode_request, encode_response
+from ._decoders import (
+    SUPPORTED_DECODERS,
+    ByteChunker,
+    ContentDecoder,
+    IdentityDecoder,
+    LineDecoder,
+    MultiDecoder,
+    TextChunker,
+    TextDecoder,
 )
-
-import pydantic
-import pydantic.generics
-from pydantic.fields import FieldInfo
-
+from ._exceptions import (
+    CookieConflict,
+    HTTPStatusError,
+    RequestNotRead,
+    ResponseNotRead,
+    StreamClosed,
+    StreamConsumed,
+    request_context,
+)
+from ._multipart import get_multipart_boundary_from_content_type
+from ._status_codes import codes
 from ._types import (
-    Body,
-    IncEx,
-    Query,
-    ModelT,
-    Headers,
-    Timeout,
-    NotGiven,
-    AnyMapping,
-    HttpxRequestFiles,
+    AsyncByteStream,
+    CookieTypes,
+    HeaderTypes,
+    QueryParamTypes,
+    RequestContent,
+    RequestData,
+    RequestExtensions,
+    RequestFiles,
+    ResponseContent,
+    ResponseExtensions,
+    SyncByteStream,
 )
-from ._utils import (
-    PropertyInfo,
-    is_list,
-    is_given,
-    lru_cache,
-    is_mapping,
-    parse_date,
-    coerce_boolean,
-    parse_datetime,
-    strip_not_given,
-    extract_type_arg,
-    is_annotated_type,
-    strip_annotated_type,
-)
-from ._compat import (
-    PYDANTIC_V2,
-    ConfigDict,
-    GenericModel as BaseGenericModel,
-    get_args,
-    is_union,
-    parse_obj,
-    get_origin,
-    is_literal_type,
-    get_model_config,
-    get_model_fields,
-    field_get_default,
-)
-from ._constants import RAW_RESPONSE_HEADER
+from ._urls import URL
+from ._utils import to_bytes_or_str, to_str
 
-if TYPE_CHECKING:
-    from pydantic_core.core_schema import ModelField, LiteralSchema, ModelFieldsSchema
+__all__ = ["Cookies", "Headers", "Request", "Response"]
 
-__all__ = ["BaseModel", "GenericModel"]
-
-_T = TypeVar("_T")
-_BaseModelT = TypeVar("_BaseModelT", bound="BaseModel")
-
-P = ParamSpec("P")
+SENSITIVE_HEADERS = {"authorization", "proxy-authorization"}
 
 
-@runtime_checkable
-class _ConfigProtocol(Protocol):
-    allow_population_by_field_name: bool
-
-
-class BaseModel(pydantic.BaseModel):
-    if PYDANTIC_V2:
-        model_config: ClassVar[ConfigDict] = ConfigDict(
-            extra="allow", defer_build=coerce_boolean(os.environ.get("DEFER_PYDANTIC_BUILD", "true"))
-        )
-    else:
-
-        @property
-        @override
-        def model_fields_set(self) -> set[str]:
-            # a forwards-compat shim for pydantic v2
-            return self.__fields_set__  # type: ignore
-
-        class Config(pydantic.BaseConfig):  # pyright: ignore[reportDeprecated]
-            extra: Any = pydantic.Extra.allow  # type: ignore
-
-    def to_dict(
-        self,
-        *,
-        mode: Literal["json", "python"] = "python",
-        use_api_names: bool = True,
-        exclude_unset: bool = True,
-        exclude_defaults: bool = False,
-        exclude_none: bool = False,
-        warnings: bool = True,
-    ) -> dict[str, object]:
-        """Recursively generate a dictionary representation of the model, optionally specifying which fields to include or exclude.
-
-        By default, fields that were not set by the API will not be included,
-        and keys will match the API response, *not* the property names from the model.
-
-        For example, if the API responds with `"fooBar": true` but we've defined a `foo_bar: bool` property,
-        the output will use the `"fooBar"` key (unless `use_api_names=False` is passed).
-
-        Args:
-            mode:
-                If mode is 'json', the dictionary will only contain JSON serializable types. e.g. `datetime` will be turned into a string, `"2024-3-22T18:11:19.117000Z"`.
-                If mode is 'python', the dictionary may contain any Python objects. e.g. `datetime(2024, 3, 22)`
-
-            use_api_names: Whether to use the key that the API responded with or the property name. Defaults to `True`.
-            exclude_unset: Whether to exclude fields that have not been explicitly set.
-            exclude_defaults: Whether to exclude fields that are set to their default value from the output.
-            exclude_none: Whether to exclude fields that have a value of `None` from the output.
-            warnings: Whether to log warnings when invalid fields are encountered. This is only supported in Pydantic v2.
-        """
-        return self.model_dump(
-            mode=mode,
-            by_alias=use_api_names,
-            exclude_unset=exclude_unset,
-            exclude_defaults=exclude_defaults,
-            exclude_none=exclude_none,
-            warnings=warnings,
-        )
-
-    def to_json(
-        self,
-        *,
-        indent: int | None = 2,
-        use_api_names: bool = True,
-        exclude_unset: bool = True,
-        exclude_defaults: bool = False,
-        exclude_none: bool = False,
-        warnings: bool = True,
-    ) -> str:
-        """Generates a JSON string representing this model as it would be received from or sent to the API (but with indentation).
-
-        By default, fields that were not set by the API will not be included,
-        and keys will match the API response, *not* the property names from the model.
-
-        For example, if the API responds with `"fooBar": true` but we've defined a `foo_bar: bool` property,
-        the output will use the `"fooBar"` key (unless `use_api_names=False` is passed).
-
-        Args:
-            indent: Indentation to use in the JSON output. If `None` is passed, the output will be compact. Defaults to `2`
-            use_api_names: Whether to use the key that the API responded with or the property name. Defaults to `True`.
-            exclude_unset: Whether to exclude fields that have not been explicitly set.
-            exclude_defaults: Whether to exclude fields that have the default value.
-            exclude_none: Whether to exclude fields that have a value of `None`.
-            warnings: Whether to show any warnings that occurred during serialization. This is only supported in Pydantic v2.
-        """
-        return self.model_dump_json(
-            indent=indent,
-            by_alias=use_api_names,
-            exclude_unset=exclude_unset,
-            exclude_defaults=exclude_defaults,
-            exclude_none=exclude_none,
-            warnings=warnings,
-        )
-
-    @override
-    def __str__(self) -> str:
-        # mypy complains about an invalid self arg
-        return f'{self.__repr_name__()}({self.__repr_str__(", ")})'  # type: ignore[misc]
-
-    # Override the 'construct' method in a way that supports recursive parsing without validation.
-    # Based on https://github.com/samuelcolvin/pydantic/issues/1168#issuecomment-817742836.
-    @classmethod
-    @override
-    def construct(
-        cls: Type[ModelT],
-        _fields_set: set[str] | None = None,
-        **values: object,
-    ) -> ModelT:
-        m = cls.__new__(cls)
-        fields_values: dict[str, object] = {}
-
-        config = get_model_config(cls)
-        populate_by_name = (
-            config.allow_population_by_field_name
-            if isinstance(config, _ConfigProtocol)
-            else config.get("populate_by_name")
-        )
-
-        if _fields_set is None:
-            _fields_set = set()
-
-        model_fields = get_model_fields(cls)
-        for name, field in model_fields.items():
-            key = field.alias
-            if key is None or (key not in values and populate_by_name):
-                key = name
-
-            if key in values:
-                fields_values[name] = _construct_field(value=values[key], field=field, key=key)
-                _fields_set.add(name)
-            else:
-                fields_values[name] = field_get_default(field)
-
-        _extra = {}
-        for key, value in values.items():
-            if key not in model_fields:
-                if PYDANTIC_V2:
-                    _extra[key] = value
-                else:
-                    _fields_set.add(key)
-                    fields_values[key] = value
-
-        object.__setattr__(m, "__dict__", fields_values)
-
-        if PYDANTIC_V2:
-            # these properties are copied from Pydantic's `model_construct()` method
-            object.__setattr__(m, "__pydantic_private__", None)
-            object.__setattr__(m, "__pydantic_extra__", _extra)
-            object.__setattr__(m, "__pydantic_fields_set__", _fields_set)
-        else:
-            # init_private_attributes() does not exist in v2
-            m._init_private_attributes()  # type: ignore
-
-            # copied from Pydantic v1's `construct()` method
-            object.__setattr__(m, "__fields_set__", _fields_set)
-
-        return m
-
-    if not TYPE_CHECKING:
-        # type checkers incorrectly complain about this assignment
-        # because the type signatures are technically different
-        # although not in practice
-        model_construct = construct
-
-    if not PYDANTIC_V2:
-        # we define aliases for some of the new pydantic v2 methods so
-        # that we can just document these methods without having to specify
-        # a specific pydantic version as some users may not know which
-        # pydantic version they are currently using
-
-        @override
-        def model_dump(
-            self,
-            *,
-            mode: Literal["json", "python"] | str = "python",
-            include: IncEx = None,
-            exclude: IncEx = None,
-            by_alias: bool = False,
-            exclude_unset: bool = False,
-            exclude_defaults: bool = False,
-            exclude_none: bool = False,
-            round_trip: bool = False,
-            warnings: bool | Literal["none", "warn", "error"] = True,
-            context: dict[str, Any] | None = None,
-            serialize_as_any: bool = False,
-        ) -> dict[str, Any]:
-            """Usage docs: https://docs.pydantic.dev/2.4/concepts/serialization/#modelmodel_dump
-
-            Generate a dictionary representation of the model, optionally specifying which fields to include or exclude.
-
-            Args:
-                mode: The mode in which `to_python` should run.
-                    If mode is 'json', the dictionary will only contain JSON serializable types.
-                    If mode is 'python', the dictionary may contain any Python objects.
-                include: A list of fields to include in the output.
-                exclude: A list of fields to exclude from the output.
-                by_alias: Whether to use the field's alias in the dictionary key if defined.
-                exclude_unset: Whether to exclude fields that are unset or None from the output.
-                exclude_defaults: Whether to exclude fields that are set to their default value from the output.
-                exclude_none: Whether to exclude fields that have a value of `None` from the output.
-                round_trip: Whether to enable serialization and deserialization round-trip support.
-                warnings: Whether to log warnings when invalid fields are encountered.
-
-            Returns:
-                A dictionary representation of the model.
-            """
-            if mode != "python":
-                raise ValueError("mode is only supported in Pydantic v2")
-            if round_trip != False:
-                raise ValueError("round_trip is only supported in Pydantic v2")
-            if warnings != True:
-                raise ValueError("warnings is only supported in Pydantic v2")
-            if context is not None:
-                raise ValueError("context is only supported in Pydantic v2")
-            if serialize_as_any != False:
-                raise ValueError("serialize_as_any is only supported in Pydantic v2")
-            return super().dict(  # pyright: ignore[reportDeprecated]
-                include=include,
-                exclude=exclude,
-                by_alias=by_alias,
-                exclude_unset=exclude_unset,
-                exclude_defaults=exclude_defaults,
-                exclude_none=exclude_none,
-            )
-
-        @override
-        def model_dump_json(
-            self,
-            *,
-            indent: int | None = None,
-            include: IncEx = None,
-            exclude: IncEx = None,
-            by_alias: bool = False,
-            exclude_unset: bool = False,
-            exclude_defaults: bool = False,
-            exclude_none: bool = False,
-            round_trip: bool = False,
-            warnings: bool | Literal["none", "warn", "error"] = True,
-            context: dict[str, Any] | None = None,
-            serialize_as_any: bool = False,
-        ) -> str:
-            """Usage docs: https://docs.pydantic.dev/2.4/concepts/serialization/#modelmodel_dump_json
-
-            Generates a JSON representation of the model using Pydantic's `to_json` method.
-
-            Args:
-                indent: Indentation to use in the JSON output. If None is passed, the output will be compact.
-                include: Field(s) to include in the JSON output. Can take either a string or set of strings.
-                exclude: Field(s) to exclude from the JSON output. Can take either a string or set of strings.
-                by_alias: Whether to serialize using field aliases.
-                exclude_unset: Whether to exclude fields that have not been explicitly set.
-                exclude_defaults: Whether to exclude fields that have the default value.
-                exclude_none: Whether to exclude fields that have a value of `None`.
-                round_trip: Whether to use serialization/deserialization between JSON and class instance.
-                warnings: Whether to show any warnings that occurred during serialization.
-
-            Returns:
-                A JSON string representation of the model.
-            """
-            if round_trip != False:
-                raise ValueError("round_trip is only supported in Pydantic v2")
-            if warnings != True:
-                raise ValueError("warnings is only supported in Pydantic v2")
-            if context is not None:
-                raise ValueError("context is only supported in Pydantic v2")
-            if serialize_as_any != False:
-                raise ValueError("serialize_as_any is only supported in Pydantic v2")
-            return super().json(  # type: ignore[reportDeprecated]
-                indent=indent,
-                include=include,
-                exclude=exclude,
-                by_alias=by_alias,
-                exclude_unset=exclude_unset,
-                exclude_defaults=exclude_defaults,
-                exclude_none=exclude_none,
-            )
-
-
-def _construct_field(value: object, field: FieldInfo, key: str) -> object:
-    if value is None:
-        return field_get_default(field)
-
-    if PYDANTIC_V2:
-        type_ = field.annotation
-    else:
-        type_ = cast(type, field.outer_type_)  # type: ignore
-
-    if type_ is None:
-        raise RuntimeError(f"Unexpected field type is None for {key}")
-
-    return construct_type(value=value, type_=type_)
-
-
-def is_basemodel(type_: type) -> bool:
-    """Returns whether or not the given type is either a `BaseModel` or a union of `BaseModel`"""
-    if is_union(type_):
-        for variant in get_args(type_):
-            if is_basemodel(variant):
-                return True
-
+def _is_known_encoding(encoding: str) -> bool:
+    """
+    Return `True` if `encoding` is a known codec.
+    """
+    try:
+        codecs.lookup(encoding)
+    except LookupError:
         return False
-
-    return is_basemodel_type(type_)
-
-
-def is_basemodel_type(type_: type) -> TypeGuard[type[BaseModel] | type[GenericModel]]:
-    origin = get_origin(type_) or type_
-    if not inspect.isclass(origin):
-        return False
-    return issubclass(origin, BaseModel) or issubclass(origin, GenericModel)
+    return True
 
 
-def build(
-    base_model_cls: Callable[P, _BaseModelT],
-    *args: P.args,
-    **kwargs: P.kwargs,
-) -> _BaseModelT:
-    """Construct a BaseModel class without validation.
-
-    This is useful for cases where you need to instantiate a `BaseModel`
-    from an API response as this provides type-safe params which isn't supported
-    by helpers like `construct_type()`.
-
-    ```py
-    build(MyModel, my_field_a="foo", my_field_b=123)
-    ```
+def _normalize_header_key(key: str | bytes, encoding: str | None = None) -> bytes:
     """
-    if args:
-        raise TypeError(
-            "Received positional arguments which are not supported; Keyword arguments must be used instead",
-        )
-
-    return cast(_BaseModelT, construct_type(type_=base_model_cls, value=kwargs))
-
-
-def construct_type_unchecked(*, value: object, type_: type[_T]) -> _T:
-    """Loose coercion to the expected type with construction of nested values.
-
-    Note: the returned value from this function is not guaranteed to match the
-    given type.
+    Coerce str/bytes into a strictly byte-wise HTTP header key.
     """
-    return cast(_T, construct_type(value=value, type_=type_))
+    return key if isinstance(key, bytes) else key.encode(encoding or "ascii")
 
 
-def construct_type(*, value: object, type_: object) -> object:
-    """Loose coercion to the expected type with construction of nested values.
-
-    If the given value does not match the expected type then it is returned as-is.
+def _normalize_header_value(value: str | bytes, encoding: str | None = None) -> bytes:
     """
-    # we allow `object` as the input type because otherwise, passing things like
-    # `Literal['value']` will be reported as a type error by type checkers
-    type_ = cast("type[object]", type_)
-
-    # unwrap `Annotated[T, ...]` -> `T`
-    if is_annotated_type(type_):
-        meta: tuple[Any, ...] = get_args(type_)[1:]
-        type_ = extract_type_arg(type_, 0)
-    else:
-        meta = tuple()
-
-    # we need to use the origin class for any types that are subscripted generics
-    # e.g. Dict[str, object]
-    origin = get_origin(type_) or type_
-    args = get_args(type_)
-
-    if is_union(origin):
-        try:
-            return validate_type(type_=cast("type[object]", type_), value=value)
-        except Exception:
-            pass
-
-        # if the type is a discriminated union then we want to construct the right variant
-        # in the union, even if the data doesn't match exactly, otherwise we'd break code
-        # that relies on the constructed class types, e.g.
-        #
-        # class FooType:
-        #   kind: Literal['foo']
-        #   value: str
-        #
-        # class BarType:
-        #   kind: Literal['bar']
-        #   value: int
-        #
-        # without this block, if the data we get is something like `{'kind': 'bar', 'value': 'foo'}` then
-        # we'd end up constructing `FooType` when it should be `BarType`.
-        discriminator = _build_discriminated_union_meta(union=type_, meta_annotations=meta)
-        if discriminator and is_mapping(value):
-            variant_value = value.get(discriminator.field_alias_from or discriminator.field_name)
-            if variant_value and isinstance(variant_value, str):
-                variant_type = discriminator.mapping.get(variant_value)
-                if variant_type:
-                    return construct_type(type_=variant_type, value=value)
-
-        # if the data is not valid, use the first variant that doesn't fail while deserializing
-        for variant in args:
-            try:
-                return construct_type(value=value, type_=variant)
-            except Exception:
-                continue
-
-        raise RuntimeError(f"Could not convert data into a valid instance of {type_}")
-
-    if origin == dict:
-        if not is_mapping(value):
-            return value
-
-        _, items_type = get_args(type_)  # Dict[_, items_type]
-        return {key: construct_type(value=item, type_=items_type) for key, item in value.items()}
-
-    if not is_literal_type(type_) and (issubclass(origin, BaseModel) or issubclass(origin, GenericModel)):
-        if is_list(value):
-            return [cast(Any, type_).construct(**entry) if is_mapping(entry) else entry for entry in value]
-
-        if is_mapping(value):
-            if issubclass(type_, BaseModel):
-                return type_.construct(**value)  # type: ignore[arg-type]
-
-            return cast(Any, type_).construct(**value)
-
-    if origin == list:
-        if not is_list(value):
-            return value
-
-        inner_type = args[0]  # List[inner_type]
-        return [construct_type(value=entry, type_=inner_type) for entry in value]
-
-    if origin == float:
-        if isinstance(value, int):
-            coerced = float(value)
-            if coerced != value:
-                return value
-            return coerced
-
+    Coerce str/bytes into a strictly byte-wise HTTP header value.
+    """
+    if isinstance(value, bytes):
         return value
-
-    if type_ == datetime:
-        try:
-            return parse_datetime(value)  # type: ignore
-        except Exception:
-            return value
-
-    if type_ == date:
-        try:
-            return parse_date(value)  # type: ignore
-        except Exception:
-            return value
-
-    return value
+    if not isinstance(value, str):
+        raise TypeError(f"Header value must be str or bytes, not {type(value)}")
+    return value.encode(encoding or "ascii")
 
 
-@runtime_checkable
-class CachedDiscriminatorType(Protocol):
-    __discriminator__: DiscriminatorDetails
+def _parse_content_type_charset(content_type: str) -> str | None:
+    # We used to use `cgi.parse_header()` here, but `cgi` became a dead battery.
+    # See: https://peps.python.org/pep-0594/#cgi
+    msg = email.message.Message()
+    msg["content-type"] = content_type
+    return msg.get_content_charset(failobj=None)
 
 
-class DiscriminatorDetails:
-    field_name: str
-    """The name of the discriminator field in the variant class, e.g.
-
-    ```py
-    class Foo(BaseModel):
-        type: Literal['foo']
-    ```
-
-    Will result in field_name='type'
+def _parse_header_links(value: str) -> list[dict[str, str]]:
     """
-
-    field_alias_from: str | None
-    """The name of the discriminator field in the API response, e.g.
-
-    ```py
-    class Foo(BaseModel):
-        type: Literal['foo'] = Field(alias='type_from_api')
-    ```
-
-    Will result in field_alias_from='type_from_api'
+    Returns a list of parsed link headers, for more info see:
+    https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Link
+    The generic syntax of those is:
+    Link: < uri-reference >; param1=value1; param2="value2"
+    So for instance:
+    Link; '<http:/.../front.jpeg>; type="image/jpeg",<http://.../back.jpeg>;'
+    would return
+        [
+            {"url": "http:/.../front.jpeg", "type": "image/jpeg"},
+            {"url": "http://.../back.jpeg"},
+        ]
+    :param value: HTTP Link entity-header field
+    :return: list of parsed link headers
     """
+    links: list[dict[str, str]] = []
+    replace_chars = " '\""
+    value = value.strip(replace_chars)
+    if not value:
+        return links
+    for val in re.split(", *<", value):
+        try:
+            url, params = val.split(";", 1)
+        except ValueError:
+            url, params = val, ""
+        link = {"url": url.strip("<> '\"")}
+        for param in params.split(";"):
+            try:
+                key, value = param.split("=")
+            except ValueError:
+                break
+            link[key.strip(replace_chars)] = value.strip(replace_chars)
+        links.append(link)
+    return links
 
-    mapping: dict[str, type]
-    """Mapping of discriminator value to variant type, e.g.
 
-    {'foo': FooVariant, 'bar': BarVariant}
+def _obfuscate_sensitive_headers(
+    items: typing.Iterable[tuple[typing.AnyStr, typing.AnyStr]],
+) -> typing.Iterator[tuple[typing.AnyStr, typing.AnyStr]]:
+    for k, v in items:
+        if to_str(k.lower()) in SENSITIVE_HEADERS:
+            v = to_bytes_or_str("[secure]", match_type_of=v)
+        yield k, v
+
+
+class Headers(typing.MutableMapping[str, str]):
+    """
+    HTTP headers, as a case-insensitive multi-dict.
     """
 
     def __init__(
         self,
-        *,
-        mapping: dict[str, type],
-        discriminator_field: str,
-        discriminator_alias: str | None,
+        headers: HeaderTypes | None = None,
+        encoding: str | None = None,
     ) -> None:
-        self.mapping = mapping
-        self.field_name = discriminator_field
-        self.field_alias_from = discriminator_alias
+        self._list = []  # type: typing.List[typing.Tuple[bytes, bytes, bytes]]
 
+        if isinstance(headers, Headers):
+            self._list = list(headers._list)
+        elif isinstance(headers, Mapping):
+            for k, v in headers.items():
+                bytes_key = _normalize_header_key(k, encoding)
+                bytes_value = _normalize_header_value(v, encoding)
+                self._list.append((bytes_key, bytes_key.lower(), bytes_value))
+        elif headers is not None:
+            for k, v in headers:
+                bytes_key = _normalize_header_key(k, encoding)
+                bytes_value = _normalize_header_value(v, encoding)
+                self._list.append((bytes_key, bytes_key.lower(), bytes_value))
 
-def _build_discriminated_union_meta(*, union: type, meta_annotations: tuple[Any, ...]) -> DiscriminatorDetails | None:
-    if isinstance(union, CachedDiscriminatorType):
-        return union.__discriminator__
+        self._encoding = encoding
 
-    discriminator_field_name: str | None = None
-
-    for annotation in meta_annotations:
-        if isinstance(annotation, PropertyInfo) and annotation.discriminator is not None:
-            discriminator_field_name = annotation.discriminator
-            break
-
-    if not discriminator_field_name:
-        return None
-
-    mapping: dict[str, type] = {}
-    discriminator_alias: str | None = None
-
-    for variant in get_args(union):
-        variant = strip_annotated_type(variant)
-        if is_basemodel_type(variant):
-            if PYDANTIC_V2:
-                field = _extract_field_schema_pv2(variant, discriminator_field_name)
-                if not field:
-                    continue
-
-                # Note: if one variant defines an alias then they all should
-                discriminator_alias = field.get("serialization_alias")
-
-                field_schema = field["schema"]
-
-                if field_schema["type"] == "literal":
-                    for entry in cast("LiteralSchema", field_schema)["expected"]:
-                        if isinstance(entry, str):
-                            mapping[entry] = variant
+    @property
+    def encoding(self) -> str:
+        """
+        Header encoding is mandated as ascii, but we allow fallbacks to utf-8
+        or iso-8859-1.
+        """
+        if self._encoding is None:
+            for encoding in ["ascii", "utf-8"]:
+                for key, value in self.raw:
+                    try:
+                        key.decode(encoding)
+                        value.decode(encoding)
+                    except UnicodeDecodeError:
+                        break
+                else:
+                    # The else block runs if 'break' did not occur, meaning
+                    # all values fitted the encoding.
+                    self._encoding = encoding
+                    break
             else:
-                field_info = cast("dict[str, FieldInfo]", variant.__fields__).get(discriminator_field_name)  # pyright: ignore[reportDeprecated, reportUnnecessaryCast]
-                if not field_info:
+                # The ISO-8859-1 encoding covers all 256 code points in a byte,
+                # so will never raise decode errors.
+                self._encoding = "iso-8859-1"
+        return self._encoding
+
+    @encoding.setter
+    def encoding(self, value: str) -> None:
+        self._encoding = value
+
+    @property
+    def raw(self) -> list[tuple[bytes, bytes]]:
+        """
+        Returns a list of the raw header items, as byte pairs.
+        """
+        return [(raw_key, value) for raw_key, _, value in self._list]
+
+    def keys(self) -> typing.KeysView[str]:
+        return {key.decode(self.encoding): None for _, key, value in self._list}.keys()
+
+    def values(self) -> typing.ValuesView[str]:
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.values()
+
+    def items(self) -> typing.ItemsView[str, str]:
+        """
+        Return `(key, value)` items of headers. Concatenate headers
+        into a single comma separated value when a key occurs multiple times.
+        """
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.items()
+
+    def multi_items(self) -> list[tuple[str, str]]:
+        """
+        Return a list of `(key, value)` pairs of headers. Allow multiple
+        occurrences of the same key without concatenating into a single
+        comma separated value.
+        """
+        return [
+            (key.decode(self.encoding), value.decode(self.encoding))
+            for _, key, value in self._list
+        ]
+
+    def get(self, key: str, default: typing.Any = None) -> typing.Any:
+        """
+        Return a header value. If multiple occurrences of the header occur
+        then concatenate them together with commas.
+        """
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def get_list(self, key: str, split_commas: bool = False) -> list[str]:
+        """
+        Return a list of all header values for a given key.
+        If `split_commas=True` is passed, then any comma separated header
+        values are split into multiple return strings.
+        """
+        get_header_key = key.lower().encode(self.encoding)
+
+        values = [
+            item_value.decode(self.encoding)
+            for _, item_key, item_value in self._list
+            if item_key.lower() == get_header_key
+        ]
+
+        if not split_commas:
+            return values
+
+        split_values = []
+        for value in values:
+            split_values.extend([item.strip() for item in value.split(",")])
+        return split_values
+
+    def update(self, headers: HeaderTypes | None = None) -> None:  # type: ignore
+        headers = Headers(headers)
+        for key in headers.keys():
+            if key in self:
+                self.pop(key)
+        self._list.extend(headers._list)
+
+    def copy(self) -> Headers:
+        return Headers(self, encoding=self.encoding)
+
+    def __getitem__(self, key: str) -> str:
+        """
+        Return a single header value.
+
+        If there are multiple headers with the same key, then we concatenate
+        them with commas. See: https://tools.ietf.org/html/rfc7230#section-3.2.2
+        """
+        normalized_key = key.lower().encode(self.encoding)
+
+        items = [
+            header_value.decode(self.encoding)
+            for _, header_key, header_value in self._list
+            if header_key == normalized_key
+        ]
+
+        if items:
+            return ", ".join(items)
+
+        raise KeyError(key)
+
+    def __setitem__(self, key: str, value: str) -> None:
+        """
+        Set the header `key` to `value`, removing any duplicate entries.
+        Retains insertion order.
+        """
+        set_key = key.encode(self._encoding or "utf-8")
+        set_value = value.encode(self._encoding or "utf-8")
+        lookup_key = set_key.lower()
+
+        found_indexes = [
+            idx
+            for idx, (_, item_key, _) in enumerate(self._list)
+            if item_key == lookup_key
+        ]
+
+        for idx in reversed(found_indexes[1:]):
+            del self._list[idx]
+
+        if found_indexes:
+            idx = found_indexes[0]
+            self._list[idx] = (set_key, lookup_key, set_value)
+        else:
+            self._list.append((set_key, lookup_key, set_value))
+
+    def __delitem__(self, key: str) -> None:
+        """
+        Remove the header `key`.
+        """
+        del_key = key.lower().encode(self.encoding)
+
+        pop_indexes = [
+            idx
+            for idx, (_, item_key, _) in enumerate(self._list)
+            if item_key.lower() == del_key
+        ]
+
+        if not pop_indexes:
+            raise KeyError(key)
+
+        for idx in reversed(pop_indexes):
+            del self._list[idx]
+
+    def __contains__(self, key: typing.Any) -> bool:
+        header_key = key.lower().encode(self.encoding)
+        return header_key in [key for _, key, _ in self._list]
+
+    def __iter__(self) -> typing.Iterator[typing.Any]:
+        return iter(self.keys())
+
+    def __len__(self) -> int:
+        return len(self._list)
+
+    def __eq__(self, other: typing.Any) -> bool:
+        try:
+            other_headers = Headers(other)
+        except ValueError:
+            return False
+
+        self_list = [(key, value) for _, key, value in self._list]
+        other_list = [(key, value) for _, key, value in other_headers._list]
+        return sorted(self_list) == sorted(other_list)
+
+    def __repr__(self) -> str:
+        class_name = self.__class__.__name__
+
+        encoding_str = ""
+        if self.encoding != "ascii":
+            encoding_str = f", encoding={self.encoding!r}"
+
+        as_list = list(_obfuscate_sensitive_headers(self.multi_items()))
+        as_dict = dict(as_list)
+
+        no_duplicate_keys = len(as_dict) == len(as_list)
+        if no_duplicate_keys:
+            return f"{class_name}({as_dict!r}{encoding_str})"
+        return f"{class_name}({as_list!r}{encoding_str})"
+
+
+class Request:
+    def __init__(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        stream: SyncByteStream | AsyncByteStream | None = None,
+        extensions: RequestExtensions | None = None,
+    ) -> None:
+        self.method = method.upper()
+        self.url = URL(url) if params is None else URL(url, params=params)
+        self.headers = Headers(headers)
+        self.extensions = {} if extensions is None else dict(extensions)
+
+        if cookies:
+            Cookies(cookies).set_cookie_header(self)
+
+        if stream is None:
+            content_type: str | None = self.headers.get("content-type")
+            headers, stream = encode_request(
+                content=content,
+                data=data,
+                files=files,
+                json=json,
+                boundary=get_multipart_boundary_from_content_type(
+                    content_type=content_type.encode(self.headers.encoding)
+                    if content_type
+                    else None
+                ),
+            )
+            self._prepare(headers)
+            self.stream = stream
+            # Load the request body, except for streaming content.
+            if isinstance(stream, ByteStream):
+                self.read()
+        else:
+            # There's an important distinction between `Request(content=...)`,
+            # and `Request(stream=...)`.
+            #
+            # Using `content=...` implies automatically populated `Host` and content
+            # headers, of either `Content-Length: ...` or `Transfer-Encoding: chunked`.
+            #
+            # Using `stream=...` will not automatically include *any*
+            # auto-populated headers.
+            #
+            # As an end-user you don't really need `stream=...`. It's only
+            # useful when:
+            #
+            # * Preserving the request stream when copying requests, eg for redirects.
+            # * Creating request instances on the *server-side* of the transport API.
+            self.stream = stream
+
+    def _prepare(self, default_headers: dict[str, str]) -> None:
+        for key, value in default_headers.items():
+            # Ignore Transfer-Encoding if the Content-Length has been set explicitly.
+            if key.lower() == "transfer-encoding" and "Content-Length" in self.headers:
+                continue
+            self.headers.setdefault(key, value)
+
+        auto_headers: list[tuple[bytes, bytes]] = []
+
+        has_host = "Host" in self.headers
+        has_content_length = (
+            "Content-Length" in self.headers or "Transfer-Encoding" in self.headers
+        )
+
+        if not has_host and self.url.host:
+            auto_headers.append((b"Host", self.url.netloc))
+        if not has_content_length and self.method in ("POST", "PUT", "PATCH"):
+            auto_headers.append((b"Content-Length", b"0"))
+
+        self.headers = Headers(auto_headers + self.headers.raw)
+
+    @property
+    def content(self) -> bytes:
+        if not hasattr(self, "_content"):
+            raise RequestNotRead()
+        return self._content
+
+    def read(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.Iterable)
+            self._content = b"".join(self.stream)
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    async def aread(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.AsyncIterable)
+            self._content = b"".join([part async for part in self.stream])
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    def __repr__(self) -> str:
+        class_name = self.__class__.__name__
+        url = str(self.url)
+        return f"<{class_name}({self.method!r}, {url!r})>"
+
+    def __getstate__(self) -> dict[str, typing.Any]:
+        return {
+            name: value
+            for name, value in self.__dict__.items()
+            if name not in ["extensions", "stream"]
+        }
+
+    def __setstate__(self, state: dict[str, typing.Any]) -> None:
+        for name, value in state.items():
+            setattr(self, name, value)
+        self.extensions = {}
+        self.stream = UnattachedStream()
+
+
+class Response:
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        headers: HeaderTypes | None = None,
+        content: ResponseContent | None = None,
+        text: str | None = None,
+        html: str | None = None,
+        json: typing.Any = None,
+        stream: SyncByteStream | AsyncByteStream | None = None,
+        request: Request | None = None,
+        extensions: ResponseExtensions | None = None,
+        history: list[Response] | None = None,
+        default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+    ) -> None:
+        self.status_code = status_code
+        self.headers = Headers(headers)
+
+        self._request: Request | None = request
+
+        # When follow_redirects=False and a redirect is received,
+        # the client will set `response.next_request`.
+        self.next_request: Request | None = None
+
+        self.extensions = {} if extensions is None else dict(extensions)
+        self.history = [] if history is None else list(history)
+
+        self.is_closed = False
+        self.is_stream_consumed = False
+
+        self.default_encoding = default_encoding
+
+        if stream is None:
+            headers, stream = encode_response(content, text, html, json)
+            self._prepare(headers)
+            self.stream = stream
+            if isinstance(stream, ByteStream):
+                # Load the response body, except for streaming content.
+                self.read()
+        else:
+            # There's an important distinction between `Response(content=...)`,
+            # and `Response(stream=...)`.
+            #
+            # Using `content=...` implies automatically populated content headers,
+            # of either `Content-Length: ...` or `Transfer-Encoding: chunked`.
+            #
+            # Using `stream=...` will not automatically include any content headers.
+            #
+            # As an end-user you don't really need `stream=...`. It's only
+            # useful when creating response instances having received a stream
+            # from the transport API.
+            self.stream = stream
+
+        self._num_bytes_downloaded = 0
+
+    def _prepare(self, default_headers: dict[str, str]) -> None:
+        for key, value in default_headers.items():
+            # Ignore Transfer-Encoding if the Content-Length has been set explicitly.
+            if key.lower() == "transfer-encoding" and "content-length" in self.headers:
+                continue
+            self.headers.setdefault(key, value)
+
+    @property
+    def elapsed(self) -> datetime.timedelta:
+        """
+        Returns the time taken for the complete request/response
+        cycle to complete.
+        """
+        if not hasattr(self, "_elapsed"):
+            raise RuntimeError(
+                "'.elapsed' may only be accessed after the response "
+                "has been read or closed."
+            )
+        return self._elapsed
+
+    @elapsed.setter
+    def elapsed(self, elapsed: datetime.timedelta) -> None:
+        self._elapsed = elapsed
+
+    @property
+    def request(self) -> Request:
+        """
+        Returns the request instance associated to the current response.
+        """
+        if self._request is None:
+            raise RuntimeError(
+                "The request instance has not been set on this response."
+            )
+        return self._request
+
+    @request.setter
+    def request(self, value: Request) -> None:
+        self._request = value
+
+    @property
+    def http_version(self) -> str:
+        try:
+            http_version: bytes = self.extensions["http_version"]
+        except KeyError:
+            return "HTTP/1.1"
+        else:
+            return http_version.decode("ascii", errors="ignore")
+
+    @property
+    def reason_phrase(self) -> str:
+        try:
+            reason_phrase: bytes = self.extensions["reason_phrase"]
+        except KeyError:
+            return codes.get_reason_phrase(self.status_code)
+        else:
+            return reason_phrase.decode("ascii", errors="ignore")
+
+    @property
+    def url(self) -> URL:
+        """
+        Returns the URL for which the request was made.
+        """
+        return self.request.url
+
+    @property
+    def content(self) -> bytes:
+        if not hasattr(self, "_content"):
+            raise ResponseNotRead()
+        return self._content
+
+    @property
+    def text(self) -> str:
+        if not hasattr(self, "_text"):
+            content = self.content
+            if not content:
+                self._text = ""
+            else:
+                decoder = TextDecoder(encoding=self.encoding or "utf-8")
+                self._text = "".join([decoder.decode(self.content), decoder.flush()])
+        return self._text
+
+    @property
+    def encoding(self) -> str | None:
+        """
+        Return an encoding to use for decoding the byte content into text.
+        The priority for determining this is given by...
+
+        * `.encoding = <>` has been set explicitly.
+        * The encoding as specified by the charset parameter in the Content-Type header.
+        * The encoding as determined by `default_encoding`, which may either be
+          a string like "utf-8" indicating the encoding to use, or may be a callable
+          which enables charset autodetection.
+        """
+        if not hasattr(self, "_encoding"):
+            encoding = self.charset_encoding
+            if encoding is None or not _is_known_encoding(encoding):
+                if isinstance(self.default_encoding, str):
+                    encoding = self.default_encoding
+                elif hasattr(self, "_content"):
+                    encoding = self.default_encoding(self._content)
+            self._encoding = encoding or "utf-8"
+        return self._encoding
+
+    @encoding.setter
+    def encoding(self, value: str) -> None:
+        """
+        Set the encoding to use for decoding the byte content into text.
+
+        If the `text` attribute has been accessed, attempting to set the
+        encoding will throw a ValueError.
+        """
+        if hasattr(self, "_text"):
+            raise ValueError(
+                "Setting encoding after `text` has been accessed is not allowed."
+            )
+        self._encoding = value
+
+    @property
+    def charset_encoding(self) -> str | None:
+        """
+        Return the encoding, as specified by the Content-Type header.
+        """
+        content_type = self.headers.get("Content-Type")
+        if content_type is None:
+            return None
+
+        return _parse_content_type_charset(content_type)
+
+    def _get_content_decoder(self) -> ContentDecoder:
+        """
+        Returns a decoder instance which can be used to decode the raw byte
+        content, depending on the Content-Encoding used in the response.
+        """
+        if not hasattr(self, "_decoder"):
+            decoders: list[ContentDecoder] = []
+            values = self.headers.get_list("content-encoding", split_commas=True)
+            for value in values:
+                value = value.strip().lower()
+                try:
+                    decoder_cls = SUPPORTED_DECODERS[value]
+                    decoders.append(decoder_cls())
+                except KeyError:
                     continue
 
-                # Note: if one variant defines an alias then they all should
-                discriminator_alias = field_info.alias
+            if len(decoders) == 1:
+                self._decoder = decoders[0]
+            elif len(decoders) > 1:
+                self._decoder = MultiDecoder(children=decoders)
+            else:
+                self._decoder = IdentityDecoder()
 
-                if field_info.annotation and is_literal_type(field_info.annotation):
-                    for entry in get_args(field_info.annotation):
-                        if isinstance(entry, str):
-                            mapping[entry] = variant
+        return self._decoder
 
-    if not mapping:
-        return None
+    @property
+    def is_informational(self) -> bool:
+        """
+        A property which is `True` for 1xx status codes, `False` otherwise.
+        """
+        return codes.is_informational(self.status_code)
 
-    details = DiscriminatorDetails(
-        mapping=mapping,
-        discriminator_field=discriminator_field_name,
-        discriminator_alias=discriminator_alias,
-    )
-    cast(CachedDiscriminatorType, union).__discriminator__ = details
-    return details
+    @property
+    def is_success(self) -> bool:
+        """
+        A property which is `True` for 2xx status codes, `False` otherwise.
+        """
+        return codes.is_success(self.status_code)
+
+    @property
+    def is_redirect(self) -> bool:
+        """
+        A property which is `True` for 3xx status codes, `False` otherwise.
+
+        Note that not all responses with a 3xx status code indicate a URL redirect.
+
+        Use `response.has_redirect_location` to determine responses with a properly
+        formed URL redirection.
+        """
+        return codes.is_redirect(self.status_code)
+
+    @property
+    def is_client_error(self) -> bool:
+        """
+        A property which is `True` for 4xx status codes, `False` otherwise.
+        """
+        return codes.is_client_error(self.status_code)
+
+    @property
+    def is_server_error(self) -> bool:
+        """
+        A property which is `True` for 5xx status codes, `False` otherwise.
+        """
+        return codes.is_server_error(self.status_code)
+
+    @property
+    def is_error(self) -> bool:
+        """
+        A property which is `True` for 4xx and 5xx status codes, `False` otherwise.
+        """
+        return codes.is_error(self.status_code)
+
+    @property
+    def has_redirect_location(self) -> bool:
+        """
+        Returns True for 3xx responses with a properly formed URL redirection,
+        `False` otherwise.
+        """
+        return (
+            self.status_code
+            in (
+                # 301 (Cacheable redirect. Method may change to GET.)
+                codes.MOVED_PERMANENTLY,
+                # 302 (Uncacheable redirect. Method may change to GET.)
+                codes.FOUND,
+                # 303 (Client should make a GET or HEAD request.)
+                codes.SEE_OTHER,
+                # 307 (Equiv. 302, but retain method)
+                codes.TEMPORARY_REDIRECT,
+                # 308 (Equiv. 301, but retain method)
+                codes.PERMANENT_REDIRECT,
+            )
+            and "Location" in self.headers
+        )
+
+    def raise_for_status(self) -> Response:
+        """
+        Raise the `HTTPStatusError` if one occurred.
+        """
+        request = self._request
+        if request is None:
+            raise RuntimeError(
+                "Cannot call `raise_for_status` as the request "
+                "instance has not been set on this response."
+            )
+
+        if self.is_success:
+            return self
+
+        if self.has_redirect_location:
+            message = (
+                "{error_type} '{0.status_code} {0.reason_phrase}' for url '{0.url}'\n"
+                "Redirect location: '{0.headers[location]}'\n"
+                "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/{0.status_code}"
+            )
+        else:
+            message = (
+                "{error_type} '{0.status_code} {0.reason_phrase}' for url '{0.url}'\n"
+                "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/{0.status_code}"
+            )
+
+        status_class = self.status_code // 100
+        error_types = {
+            1: "Informational response",
+            3: "Redirect response",
+            4: "Client error",
+            5: "Server error",
+        }
+        error_type = error_types.get(status_class, "Invalid status code")
+        message = message.format(self, error_type=error_type)
+        raise HTTPStatusError(message, request=request, response=self)
+
+    def json(self, **kwargs: typing.Any) -> typing.Any:
+        return jsonlib.loads(self.content, **kwargs)
+
+    @property
+    def cookies(self) -> Cookies:
+        if not hasattr(self, "_cookies"):
+            self._cookies = Cookies()
+            self._cookies.extract_cookies(self)
+        return self._cookies
+
+    @property
+    def links(self) -> dict[str | None, dict[str, str]]:
+        """
+        Returns the parsed header links of the response, if any
+        """
+        header = self.headers.get("link")
+        if header is None:
+            return {}
+
+        return {
+            (link.get("rel") or link.get("url")): link
+            for link in _parse_header_links(header)
+        }
+
+    @property
+    def num_bytes_downloaded(self) -> int:
+        return self._num_bytes_downloaded
+
+    def __repr__(self) -> str:
+        return f"<Response [{self.status_code} {self.reason_phrase}]>"
+
+    def __getstate__(self) -> dict[str, typing.Any]:
+        return {
+            name: value
+            for name, value in self.__dict__.items()
+            if name not in ["extensions", "stream", "is_closed", "_decoder"]
+        }
+
+    def __setstate__(self, state: dict[str, typing.Any]) -> None:
+        for name, value in state.items():
+            setattr(self, name, value)
+        self.is_closed = True
+        self.extensions = {}
+        self.stream = UnattachedStream()
+
+    def read(self) -> bytes:
+        """
+        Read and return the response content.
+        """
+        if not hasattr(self, "_content"):
+            self._content = b"".join(self.iter_bytes())
+        return self._content
+
+    def iter_bytes(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
+        """
+        A byte-iterator over the decoded response content.
+        This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
+        """
+        if hasattr(self, "_content"):
+            chunk_size = len(self._content) if chunk_size is None else chunk_size
+            for i in range(0, len(self._content), max(chunk_size, 1)):
+                yield self._content[i : i + chunk_size]
+        else:
+            decoder = self._get_content_decoder()
+            chunker = ByteChunker(chunk_size=chunk_size)
+            with request_context(request=self._request):
+                for raw_bytes in self.iter_raw():
+                    decoded = decoder.decode(raw_bytes)
+                    for chunk in chunker.decode(decoded):
+                        yield chunk
+                decoded = decoder.flush()
+                for chunk in chunker.decode(decoded):
+                    yield chunk  # pragma: no cover
+                for chunk in chunker.flush():
+                    yield chunk
+
+    def iter_text(self, chunk_size: int | None = None) -> typing.Iterator[str]:
+        """
+        A str-iterator over the decoded response content
+        that handles both gzip, deflate, etc but also detects the content's
+        string encoding.
+        """
+        decoder = TextDecoder(encoding=self.encoding or "utf-8")
+        chunker = TextChunker(chunk_size=chunk_size)
+        with request_context(request=self._request):
+            for byte_content in self.iter_bytes():
+                text_content = decoder.decode(byte_content)
+                for chunk in chunker.decode(text_content):
+                    yield chunk
+            text_content = decoder.flush()
+            for chunk in chunker.decode(text_content):
+                yield chunk  # pragma: no cover
+            for chunk in chunker.flush():
+                yield chunk
+
+    def iter_lines(self) -> typing.Iterator[str]:
+        decoder = LineDecoder()
+        with request_context(request=self._request):
+            for text in self.iter_text():
+                for line in decoder.decode(text):
+                    yield line
+            for line in decoder.flush():
+                yield line
+
+    def iter_raw(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
+        """
+        A byte-iterator over the raw response content.
+        """
+        if self.is_stream_consumed:
+            raise StreamConsumed()
+        if self.is_closed:
+            raise StreamClosed()
+        if not isinstance(self.stream, SyncByteStream):
+            raise RuntimeError("Attempted to call a sync iterator on an async stream.")
+
+        self.is_stream_consumed = True
+        self._num_bytes_downloaded = 0
+        chunker = ByteChunker(chunk_size=chunk_size)
+
+        with request_context(request=self._request):
+            for raw_stream_bytes in self.stream:
+                self._num_bytes_downloaded += len(raw_stream_bytes)
+                for chunk in chunker.decode(raw_stream_bytes):
+                    yield chunk
+
+        for chunk in chunker.flush():
+            yield chunk
+
+        self.close()
+
+    def close(self) -> None:
+        """
+        Close the response and release the connection.
+        Automatically called if the response body is read to completion.
+        """
+        if not isinstance(self.stream, SyncByteStream):
+            raise RuntimeError("Attempted to call an sync close on an async stream.")
+
+        if not self.is_closed:
+            self.is_closed = True
+            with request_context(request=self._request):
+                self.stream.close()
+
+    async def aread(self) -> bytes:
+        """
+        Read and return the response content.
+        """
+        if not hasattr(self, "_content"):
+            self._content = b"".join([part async for part in self.aiter_bytes()])
+        return self._content
+
+    async def aiter_bytes(
+        self, chunk_size: int | None = None
+    ) -> typing.AsyncIterator[bytes]:
+        """
+        A byte-iterator over the decoded response content.
+        This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
+        """
+        if hasattr(self, "_content"):
+            chunk_size = len(self._content) if chunk_size is None else chunk_size
+            for i in range(0, len(self._content), max(chunk_size, 1)):
+                yield self._content[i : i + chunk_size]
+        else:
+            decoder = self._get_content_decoder()
+            chunker = ByteChunker(chunk_size=chunk_size)
+            with request_context(request=self._request):
+                async for raw_bytes in self.aiter_raw():
+                    decoded = decoder.decode(raw_bytes)
+                    for chunk in chunker.decode(decoded):
+                        yield chunk
+                decoded = decoder.flush()
+                for chunk in chunker.decode(decoded):
+                    yield chunk  # pragma: no cover
+                for chunk in chunker.flush():
+                    yield chunk
+
+    async def aiter_text(
+        self, chunk_size: int | None = None
+    ) -> typing.AsyncIterator[str]:
+        """
+        A str-iterator over the decoded response content
+        that handles both gzip, deflate, etc but also detects the content's
+        string encoding.
+        """
+        decoder = TextDecoder(encoding=self.encoding or "utf-8")
+        chunker = TextChunker(chunk_size=chunk_size)
+        with request_context(request=self._request):
+            async for byte_content in self.aiter_bytes():
+                text_content = decoder.decode(byte_content)
+                for chunk in chunker.decode(text_content):
+                    yield chunk
+            text_content = decoder.flush()
+            for chunk in chunker.decode(text_content):
+                yield chunk  # pragma: no cover
+            for chunk in chunker.flush():
+                yield chunk
+
+    async def aiter_lines(self) -> typing.AsyncIterator[str]:
+        decoder = LineDecoder()
+        with request_context(request=self._request):
+            async for text in self.aiter_text():
+                for line in decoder.decode(text):
+                    yield line
+            for line in decoder.flush():
+                yield line
+
+    async def aiter_raw(
+        self, chunk_size: int | None = None
+    ) -> typing.AsyncIterator[bytes]:
+        """
+        A byte-iterator over the raw response content.
+        """
+        if self.is_stream_consumed:
+            raise StreamConsumed()
+        if self.is_closed:
+            raise StreamClosed()
+        if not isinstance(self.stream, AsyncByteStream):
+            raise RuntimeError("Attempted to call an async iterator on an sync stream.")
+
+        self.is_stream_consumed = True
+        self._num_bytes_downloaded = 0
+        chunker = ByteChunker(chunk_size=chunk_size)
+
+        with request_context(request=self._request):
+            async for raw_stream_bytes in self.stream:
+                self._num_bytes_downloaded += len(raw_stream_bytes)
+                for chunk in chunker.decode(raw_stream_bytes):
+                    yield chunk
+
+        for chunk in chunker.flush():
+            yield chunk
+
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """
+        Close the response and release the connection.
+        Automatically called if the response body is read to completion.
+        """
+        if not isinstance(self.stream, AsyncByteStream):
+            raise RuntimeError("Attempted to call an async close on an sync stream.")
+
+        if not self.is_closed:
+            self.is_closed = True
+            with request_context(request=self._request):
+                await self.stream.aclose()
 
 
-def _extract_field_schema_pv2(model: type[BaseModel], field_name: str) -> ModelField | None:
-    schema = model.__pydantic_core_schema__
-    if schema["type"] != "model":
-        return None
-
-    fields_schema = schema["schema"]
-    if fields_schema["type"] != "model-fields":
-        return None
-
-    fields_schema = cast("ModelFieldsSchema", fields_schema)
-
-    field = fields_schema["fields"].get(field_name)
-    if not field:
-        return None
-
-    return cast("ModelField", field)  # pyright: ignore[reportUnnecessaryCast]
-
-
-def validate_type(*, type_: type[_T], value: object) -> _T:
-    """Strict validation that the given value matches the expected type"""
-    if inspect.isclass(type_) and issubclass(type_, pydantic.BaseModel):
-        return cast(_T, parse_obj(type_, value))
-
-    return cast(_T, _validate_non_model_type(type_=type_, value=value))
-
-
-def set_pydantic_config(typ: Any, config: pydantic.ConfigDict) -> None:
-    """Add a pydantic config for the given type.
-
-    Note: this is a no-op on Pydantic v1.
+class Cookies(typing.MutableMapping[str, str]):
     """
-    setattr(typ, "__pydantic_config__", config)  # noqa: B010
+    HTTP Cookies, as a mutable mapping.
+    """
 
+    def __init__(self, cookies: CookieTypes | None = None) -> None:
+        if cookies is None or isinstance(cookies, dict):
+            self.jar = CookieJar()
+            if isinstance(cookies, dict):
+                for key, value in cookies.items():
+                    self.set(key, value)
+        elif isinstance(cookies, list):
+            self.jar = CookieJar()
+            for key, value in cookies:
+                self.set(key, value)
+        elif isinstance(cookies, Cookies):
+            self.jar = CookieJar()
+            for cookie in cookies.jar:
+                self.jar.set_cookie(cookie)
+        else:
+            self.jar = cookies
 
-# our use of subclasssing here causes weirdness for type checkers,
-# so we just pretend that we don't subclass
-if TYPE_CHECKING:
-    GenericModel = BaseModel
-else:
+    def extract_cookies(self, response: Response) -> None:
+        """
+        Loads any cookies based on the response `Set-Cookie` headers.
+        """
+        urllib_response = self._CookieCompatResponse(response)
+        urllib_request = self._CookieCompatRequest(response.request)
 
-    class GenericModel(BaseGenericModel, BaseModel):
-        pass
+        self.jar.extract_cookies(urllib_response, urllib_request)  # type: ignore
 
+    def set_cookie_header(self, request: Request) -> None:
+        """
+        Sets an appropriate 'Cookie:' HTTP header on the `Request`.
+        """
+        urllib_request = self._CookieCompatRequest(request)
+        self.jar.add_cookie_header(urllib_request)
 
-if PYDANTIC_V2:
-    from pydantic import TypeAdapter as _TypeAdapter
+    def set(self, name: str, value: str, domain: str = "", path: str = "/") -> None:
+        """
+        Set a cookie value by name. May optionally include domain and path.
+        """
+        kwargs = {
+            "version": 0,
+            "name": name,
+            "value": value,
+            "port": None,
+            "port_specified": False,
+            "domain": domain,
+            "domain_specified": bool(domain),
+            "domain_initial_dot": domain.startswith("."),
+            "path": path,
+            "path_specified": bool(path),
+            "secure": False,
+            "expires": None,
+            "discard": True,
+            "comment": None,
+            "comment_url": None,
+            "rest": {"HttpOnly": None},
+            "rfc2109": False,
+        }
+        cookie = Cookie(**kwargs)  # type: ignore
+        self.jar.set_cookie(cookie)
 
-    _CachedTypeAdapter = cast("TypeAdapter[object]", lru_cache(maxsize=None)(_TypeAdapter))
+    def get(  # type: ignore
+        self,
+        name: str,
+        default: str | None = None,
+        domain: str | None = None,
+        path: str | None = None,
+    ) -> str | None:
+        """
+        Get a cookie by name. May optionally include domain and path
+        in order to specify exactly which cookie to retrieve.
+        """
+        value = None
+        for cookie in self.jar:
+            if cookie.name == name:
+                if domain is None or cookie.domain == domain:
+                    if path is None or cookie.path == path:
+                        if value is not None:
+                            message = f"Multiple cookies exist with name={name}"
+                            raise CookieConflict(message)
+                        value = cookie.value
 
-    if TYPE_CHECKING:
-        from pydantic import TypeAdapter
-    else:
-        TypeAdapter = _CachedTypeAdapter
+        if value is None:
+            return default
+        return value
 
-    def _validate_non_model_type(*, type_: type[_T], value: object) -> _T:
-        return TypeAdapter(type_).validate_python(value)
+    def delete(
+        self,
+        name: str,
+        domain: str | None = None,
+        path: str | None = None,
+    ) -> None:
+        """
+        Delete a cookie by name. May optionally include domain and path
+        in order to specify exactly which cookie to delete.
+        """
+        if domain is not None and path is not None:
+            return self.jar.clear(domain, path, name)
 
-elif not TYPE_CHECKING:  # TODO: condition is weird
+        remove = [
+            cookie
+            for cookie in self.jar
+            if cookie.name == name
+            and (domain is None or cookie.domain == domain)
+            and (path is None or cookie.path == path)
+        ]
 
-    class RootModel(GenericModel, Generic[_T]):
-        """Used as a placeholder to easily convert runtime types to a Pydantic format
-        to provide validation.
+        for cookie in remove:
+            self.jar.clear(cookie.domain, cookie.path, cookie.name)
 
-        For example:
-        ```py
-        validated = RootModel[int](__root__="5").__root__
-        # validated: 5
-        ```
+    def clear(self, domain: str | None = None, path: str | None = None) -> None:
+        """
+        Delete all cookies. Optionally include a domain and path in
+        order to only delete a subset of all the cookies.
+        """
+        args = []
+        if domain is not None:
+            args.append(domain)
+        if path is not None:
+            assert domain is not None
+            args.append(path)
+        self.jar.clear(*args)
+
+    def update(self, cookies: CookieTypes | None = None) -> None:  # type: ignore
+        cookies = Cookies(cookies)
+        for cookie in cookies.jar:
+            self.jar.set_cookie(cookie)
+
+    def __setitem__(self, name: str, value: str) -> None:
+        return self.set(name, value)
+
+    def __getitem__(self, name: str) -> str:
+        value = self.get(name)
+        if value is None:
+            raise KeyError(name)
+        return value
+
+    def __delitem__(self, name: str) -> None:
+        return self.delete(name)
+
+    def __len__(self) -> int:
+        return len(self.jar)
+
+    def __iter__(self) -> typing.Iterator[str]:
+        return (cookie.name for cookie in self.jar)
+
+    def __bool__(self) -> bool:
+        for _ in self.jar:
+            return True
+        return False
+
+    def __repr__(self) -> str:
+        cookies_repr = ", ".join(
+            [
+                f"<Cookie {cookie.name}={cookie.value} for {cookie.domain} />"
+                for cookie in self.jar
+            ]
+        )
+
+        return f"<Cookies[{cookies_repr}]>"
+
+    class _CookieCompatRequest(urllib.request.Request):
+        """
+        Wraps a `Request` instance up in a compatibility interface suitable
+        for use with `CookieJar` operations.
         """
 
-        __root__: _T
+        def __init__(self, request: Request) -> None:
+            super().__init__(
+                url=str(request.url),
+                headers=dict(request.headers),
+                method=request.method,
+            )
+            self.request = request
 
-    def _validate_non_model_type(*, type_: type[_T], value: object) -> _T:
-        model = _create_pydantic_model(type_).validate(value)
-        return cast(_T, model.__root__)
+        def add_unredirected_header(self, key: str, value: str) -> None:
+            super().add_unredirected_header(key, value)
+            self.request.headers[key] = value
 
-    def _create_pydantic_model(type_: _T) -> Type[RootModel[_T]]:
-        return RootModel[type_]  # type: ignore
+    class _CookieCompatResponse:
+        """
+        Wraps a `Request` instance up in a compatibility interface suitable
+        for use with `CookieJar` operations.
+        """
 
+        def __init__(self, response: Response) -> None:
+            self.response = response
 
-class FinalRequestOptionsInput(TypedDict, total=False):
-    method: Required[str]
-    url: Required[str]
-    params: Query
-    headers: Headers
-    max_retries: int
-    timeout: float | Timeout | None
-    files: HttpxRequestFiles | None
-    idempotency_key: str
-    json_data: Body
-    extra_json: AnyMapping
-
-
-@final
-class FinalRequestOptions(pydantic.BaseModel):
-    method: str
-    url: str
-    params: Query = {}
-    headers: Union[Headers, NotGiven] = NotGiven()
-    max_retries: Union[int, NotGiven] = NotGiven()
-    timeout: Union[float, Timeout, None, NotGiven] = NotGiven()
-    files: Union[HttpxRequestFiles, None] = None
-    idempotency_key: Union[str, None] = None
-    post_parser: Union[Callable[[Any], Any], NotGiven] = NotGiven()
-
-    # It should be noted that we cannot use `json` here as that would override
-    # a BaseModel method in an incompatible fashion.
-    json_data: Union[Body, None] = None
-    extra_json: Union[AnyMapping, None] = None
-
-    if PYDANTIC_V2:
-        model_config: ClassVar[ConfigDict] = ConfigDict(arbitrary_types_allowed=True)
-    else:
-
-        class Config(pydantic.BaseConfig):  # pyright: ignore[reportDeprecated]
-            arbitrary_types_allowed: bool = True
-
-    def get_max_retries(self, max_retries: int) -> int:
-        if isinstance(self.max_retries, NotGiven):
-            return max_retries
-        return self.max_retries
-
-    def _strip_raw_response_header(self) -> None:
-        if not is_given(self.headers):
-            return
-
-        if self.headers.get(RAW_RESPONSE_HEADER):
-            self.headers = {**self.headers}
-            self.headers.pop(RAW_RESPONSE_HEADER)
-
-    # override the `construct` method so that we can run custom transformations.
-    # this is necessary as we don't want to do any actual runtime type checking
-    # (which means we can't use validators) but we do want to ensure that `NotGiven`
-    # values are not present
-    #
-    # type ignore required because we're adding explicit types to `**values`
-    @classmethod
-    def construct(  # type: ignore
-        cls,
-        _fields_set: set[str] | None = None,
-        **values: Unpack[FinalRequestOptionsInput],
-    ) -> FinalRequestOptions:
-        kwargs: dict[str, Any] = {
-            # we unconditionally call `strip_not_given` on any value
-            # as it will just ignore any non-mapping types
-            key: strip_not_given(value)
-            for key, value in values.items()
-        }
-        if PYDANTIC_V2:
-            return super().model_construct(_fields_set, **kwargs)
-        return cast(FinalRequestOptions, super().construct(_fields_set, **kwargs))  # pyright: ignore[reportDeprecated]
-
-    if not TYPE_CHECKING:
-        # type checkers incorrectly complain about this assignment
-        model_construct = construct
+        def info(self) -> email.message.Message:
+            info = email.message.Message()
+            for key, value in self.response.headers.multi_items():
+                # Note that setting `info[key]` here is an "append" operation,
+                # not a "replace" operation.
+                # https://docs.python.org/3/library/email.compat32-message.html#email.message.Message.__setitem__
+                info[key] = value
+            return info

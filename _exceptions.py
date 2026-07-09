@@ -1,110 +1,379 @@
-# File generated from our OpenAPI spec by Stainless. See CONTRIBUTING.md for details.
+"""
+Our exception hierarchy:
+
+* HTTPError
+  x RequestError
+    + TransportError
+      - TimeoutException
+        · ConnectTimeout
+        · ReadTimeout
+        · WriteTimeout
+        · PoolTimeout
+      - NetworkError
+        · ConnectError
+        · ReadError
+        · WriteError
+        · CloseError
+      - ProtocolError
+        · LocalProtocolError
+        · RemoteProtocolError
+      - ProxyError
+      - UnsupportedProtocol
+    + DecodingError
+    + TooManyRedirects
+  x HTTPStatusError
+* InvalidURL
+* CookieConflict
+* StreamError
+  x StreamConsumed
+  x StreamClosed
+  x ResponseNotRead
+  x RequestNotRead
+"""
 
 from __future__ import annotations
 
-from typing_extensions import Literal
+import contextlib
+import typing
 
-import httpx
+if typing.TYPE_CHECKING:
+    from ._models import Request, Response  # pragma: no cover
 
 __all__ = [
-    "BadRequestError",
-    "AuthenticationError",
-    "PermissionDeniedError",
-    "NotFoundError",
-    "ConflictError",
-    "UnprocessableEntityError",
-    "RateLimitError",
-    "InternalServerError",
+    "CloseError",
+    "ConnectError",
+    "ConnectTimeout",
+    "CookieConflict",
+    "DecodingError",
+    "HTTPError",
+    "HTTPStatusError",
+    "InvalidURL",
+    "LocalProtocolError",
+    "NetworkError",
+    "PoolTimeout",
+    "ProtocolError",
+    "ProxyError",
+    "ReadError",
+    "ReadTimeout",
+    "RemoteProtocolError",
+    "RequestError",
+    "RequestNotRead",
+    "ResponseNotRead",
+    "StreamClosed",
+    "StreamConsumed",
+    "StreamError",
+    "TimeoutException",
+    "TooManyRedirects",
+    "TransportError",
+    "UnsupportedProtocol",
+    "WriteError",
+    "WriteTimeout",
 ]
 
 
-class AnthropicError(Exception):
-    pass
+class HTTPError(Exception):
+    """
+    Base class for `RequestError` and `HTTPStatusError`.
 
+    Useful for `try...except` blocks when issuing a request,
+    and then calling `.raise_for_status()`.
 
-class APIError(AnthropicError):
-    message: str
-    request: httpx.Request
+    For example:
 
-    body: object | None
-    """The API response body.
-
-    If the API responded with a valid JSON structure then this property will be the
-    decoded result.
-
-    If it isn't a valid JSON structure then this will be the raw response.
-
-    If there was no response associated with this error then it will be `None`.
+    ```
+    try:
+        response = httpx.get("https://www.example.com")
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        print(f"HTTP Exception for {exc.request.url} - {exc}")
+    ```
     """
 
-    def __init__(self, message: str, request: httpx.Request, *, body: object | None) -> None:  # noqa: ARG002
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self._request: Request | None = None
+
+    @property
+    def request(self) -> Request:
+        if self._request is None:
+            raise RuntimeError("The .request property has not been set.")
+        return self._request
+
+    @request.setter
+    def request(self, request: Request) -> None:
+        self._request = request
+
+
+class RequestError(HTTPError):
+    """
+    Base class for all exceptions that may occur when issuing a `.request()`.
+    """
+
+    def __init__(self, message: str, *, request: Request | None = None) -> None:
+        super().__init__(message)
+        # At the point an exception is raised we won't typically have a request
+        # instance to associate it with.
+        #
+        # The 'request_context' context manager is used within the Client and
+        # Response methods in order to ensure that any raised exceptions
+        # have a `.request` property set on them.
+        self._request = request
+
+
+class TransportError(RequestError):
+    """
+    Base class for all exceptions that occur at the level of the Transport API.
+    """
+
+
+# Timeout exceptions...
+
+
+class TimeoutException(TransportError):
+    """
+    The base class for timeout errors.
+
+    An operation has timed out.
+    """
+
+
+class ConnectTimeout(TimeoutException):
+    """
+    Timed out while connecting to the host.
+    """
+
+
+class ReadTimeout(TimeoutException):
+    """
+    Timed out while receiving data from the host.
+    """
+
+
+class WriteTimeout(TimeoutException):
+    """
+    Timed out while sending data to the host.
+    """
+
+
+class PoolTimeout(TimeoutException):
+    """
+    Timed out waiting to acquire a connection from the pool.
+    """
+
+
+# Core networking exceptions...
+
+
+class NetworkError(TransportError):
+    """
+    The base class for network-related errors.
+
+    An error occurred while interacting with the network.
+    """
+
+
+class ReadError(NetworkError):
+    """
+    Failed to receive data from the network.
+    """
+
+
+class WriteError(NetworkError):
+    """
+    Failed to send data through the network.
+    """
+
+
+class ConnectError(NetworkError):
+    """
+    Failed to establish a connection.
+    """
+
+
+class CloseError(NetworkError):
+    """
+    Failed to close a connection.
+    """
+
+
+# Other transport exceptions...
+
+
+class ProxyError(TransportError):
+    """
+    An error occurred while establishing a proxy connection.
+    """
+
+
+class UnsupportedProtocol(TransportError):
+    """
+    Attempted to make a request to an unsupported protocol.
+
+    For example issuing a request to `ftp://www.example.com`.
+    """
+
+
+class ProtocolError(TransportError):
+    """
+    The protocol was violated.
+    """
+
+
+class LocalProtocolError(ProtocolError):
+    """
+    A protocol was violated by the client.
+
+    For example if the user instantiated a `Request` instance explicitly,
+    failed to include the mandatory `Host:` header, and then issued it directly
+    using `client.send()`.
+    """
+
+
+class RemoteProtocolError(ProtocolError):
+    """
+    The protocol was violated by the server.
+
+    For example, returning malformed HTTP.
+    """
+
+
+# Other request exceptions...
+
+
+class DecodingError(RequestError):
+    """
+    Decoding of the response failed, due to a malformed encoding.
+    """
+
+
+class TooManyRedirects(RequestError):
+    """
+    Too many redirects.
+    """
+
+
+# Client errors
+
+
+class HTTPStatusError(HTTPError):
+    """
+    The response had an error HTTP status of 4xx or 5xx.
+
+    May be raised when calling `response.raise_for_status()`
+    """
+
+    def __init__(self, message: str, *, request: Request, response: Response) -> None:
         super().__init__(message)
         self.request = request
-        self.message = message
-        self.body = body
-
-
-class APIResponseValidationError(APIError):
-    response: httpx.Response
-    status_code: int
-
-    def __init__(self, response: httpx.Response, body: object | None, *, message: str | None = None) -> None:
-        super().__init__(message or "Data returned by API invalid for expected schema.", response.request, body=body)
         self.response = response
-        self.status_code = response.status_code
 
 
-class APIStatusError(APIError):
-    """Raised when an API response has a status code of 4xx or 5xx."""
+class InvalidURL(Exception):
+    """
+    URL is improperly formed or cannot be parsed.
+    """
 
-    response: httpx.Response
-    status_code: int
-    request_id: str | None
-
-    def __init__(self, message: str, *, response: httpx.Response, body: object | None) -> None:
-        super().__init__(message, response.request, body=body)
-        self.response = response
-        self.status_code = response.status_code
-        self.request_id = response.headers.get("request-id")
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
 
 
-class APIConnectionError(APIError):
-    def __init__(self, *, message: str = "Connection error.", request: httpx.Request) -> None:
-        super().__init__(message, request, body=None)
+class CookieConflict(Exception):
+    """
+    Attempted to lookup a cookie by name, but multiple cookies existed.
+
+    Can occur when calling `response.cookies.get(...)`.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
 
 
-class APITimeoutError(APIConnectionError):
-    def __init__(self, request: httpx.Request) -> None:
-        super().__init__(message="Request timed out.", request=request)
+# Stream exceptions...
+
+# These may occur as the result of a programming error, by accessing
+# the request/response stream in an invalid manner.
 
 
-class BadRequestError(APIStatusError):
-    status_code: Literal[400] = 400  # pyright: ignore[reportIncompatibleVariableOverride]
+class StreamError(RuntimeError):
+    """
+    The base class for stream exceptions.
+
+    The developer made an error in accessing the request stream in
+    an invalid way.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
 
 
-class AuthenticationError(APIStatusError):
-    status_code: Literal[401] = 401  # pyright: ignore[reportIncompatibleVariableOverride]
+class StreamConsumed(StreamError):
+    """
+    Attempted to read or stream content, but the content has already
+    been streamed.
+    """
+
+    def __init__(self) -> None:
+        message = (
+            "Attempted to read or stream some content, but the content has "
+            "already been streamed. For requests, this could be due to passing "
+            "a generator as request content, and then receiving a redirect "
+            "response or a secondary request as part of an authentication flow."
+            "For responses, this could be due to attempting to stream the response "
+            "content more than once."
+        )
+        super().__init__(message)
 
 
-class PermissionDeniedError(APIStatusError):
-    status_code: Literal[403] = 403  # pyright: ignore[reportIncompatibleVariableOverride]
+class StreamClosed(StreamError):
+    """
+    Attempted to read or stream response content, but the request has been
+    closed.
+    """
+
+    def __init__(self) -> None:
+        message = (
+            "Attempted to read or stream content, but the stream has " "been closed."
+        )
+        super().__init__(message)
 
 
-class NotFoundError(APIStatusError):
-    status_code: Literal[404] = 404  # pyright: ignore[reportIncompatibleVariableOverride]
+class ResponseNotRead(StreamError):
+    """
+    Attempted to access streaming response content, without having called `read()`.
+    """
+
+    def __init__(self) -> None:
+        message = (
+            "Attempted to access streaming response content,"
+            " without having called `read()`."
+        )
+        super().__init__(message)
 
 
-class ConflictError(APIStatusError):
-    status_code: Literal[409] = 409  # pyright: ignore[reportIncompatibleVariableOverride]
+class RequestNotRead(StreamError):
+    """
+    Attempted to access streaming request content, without having called `read()`.
+    """
+
+    def __init__(self) -> None:
+        message = (
+            "Attempted to access streaming request content,"
+            " without having called `read()`."
+        )
+        super().__init__(message)
 
 
-class UnprocessableEntityError(APIStatusError):
-    status_code: Literal[422] = 422  # pyright: ignore[reportIncompatibleVariableOverride]
-
-
-class RateLimitError(APIStatusError):
-    status_code: Literal[429] = 429  # pyright: ignore[reportIncompatibleVariableOverride]
-
-
-class InternalServerError(APIStatusError):
-    pass
+@contextlib.contextmanager
+def request_context(
+    request: Request | None = None,
+) -> typing.Iterator[None]:
+    """
+    A context manager that can be used to attach the given request context
+    to any `RequestError` exceptions that are raised within the block.
+    """
+    try:
+        yield
+    except RequestError as exc:
+        if request is not None:
+            exc.request = request
+        raise exc
