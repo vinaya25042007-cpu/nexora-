@@ -1,0 +1,5 @@
+{
+  "appId": "com.yourname.recoveryapp",
+  "appName": "YourAppName",
+  "webDir": "dist"
+}

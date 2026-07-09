@@ -1,0 +1,171 @@
+/* ===== RESET & BASE STYLES ===== */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  font-family: 'Segoe UI', Arial, sans-serif;
+}
+
+body {
+  background: #f4f9fb;
+  color: #1a2b3c;
+}
+
+/* ===== NAVBAR ===== */
+.navbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 40px;
+  background: #ffffff;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.logo {
+  font-size: 22px;
+  font-weight: 700;
+  color: #0e7c86;
+}
+
+.nav-links {
+  display: flex;
+  list-style: none;
+  gap: 28px;
+}
+
+.nav-links a {
+  text-decoration: none;
+  color: #333;
+  font-weight: 500;
+  transition: color 0.2s;
+}
+
+.nav-links a:hover {
+  color: #0e7c86;
+}
+
+.sos-btn {
+  background: #e63946;
+  color: white;
+  border: none;
+  padding: 10px 18px;
+  border-radius: 20px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.2s;
+}
+
+.sos-btn:hover {
+  transform: scale(1.05);
+}
+
+/* ===== HERO SECTION ===== */
+.hero {
+  text-align: center;
+  padding: 100px 20px;
+}
+
+.hero h1 {
+  font-size: 42px;
+  margin-bottom: 20px;
+}
+
+.hero h1 span {
+  color: #0e7c86;
+}
+
+.hero p {
+  font-size: 18px;
+  color: #556;
+  max-width: 500px;
+  margin: 0 auto 30px auto;
+}
+
+.cta-btn {
+  background: #0e7c86;
+  color: white;
+  border: none;
+  padding: 14px 32px;
+  border-radius: 30px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.cta-btn:hover {
+  background: #0a5f68;
+  transform: translateY(-2px);
+}
+/* ===== WOUND UPLOAD SECTION ===== */
+.wound-container {
+  max-width: 500px;
+  margin: 0 auto;
+  text-align: center;
+}
+
+.upload-box {
+  border: 3px dashed #0e7c86;
+  border-radius: 16px;
+  padding: 40px 20px;
+  background: white;
+  cursor: pointer;
+  margin-bottom: 20px;
+  transition: background 0.2s;
+}
+
+.upload-box:hover {
+  background: #eafaf9;
+}
+
+#woundPreview {
+  max-width: 100%;
+  border-radius: 12px;
+  max-height: 300px;
+}
+
+/* Result Card */
+.result-card {
+  background: white;
+  border-radius: 16px;
+  padding: 24px;
+  margin-top: 24px;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+  text-align: left;
+}
+
+.risk-badge {
+  display: inline-block;
+  padding: 6px 16px;
+  border-radius: 20px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+
+.risk-normal {
+  background: #d4f7dc;
+  color: #1a7a34;
+}
+
+.risk-mild {
+  background: #fff3cd;
+  color: #a66a00;
+}
+
+.risk-urgent {
+  background: #fcd4d4;
+  color: #b3261e;
+}
+
+#riskDetails {
+  margin-top: 12px;
+  padding-left: 20px;
+}
+
+#riskDetails li {
+  margin-bottom: 6px;
+  color: #444;
+}
