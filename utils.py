@@ -1,130 +1,135 @@
-"""
-Utility functions for MCPClient and Tiny Agents.
+# This file is dual licensed under the terms of the Apache License, Version
+# 2.0, and the BSD License. See the LICENSE file in the root of this repository
+# for complete details.
 
-Formatting utilities taken from the JS SDK: https://github.com/huggingface/huggingface.js/blob/main/packages/mcp-client/src/ResultFormatter.ts.
-"""
+from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import TYPE_CHECKING, Optional
-
-from huggingface_hub import snapshot_download
-from huggingface_hub.errors import EntryNotFoundError
-
-from .constants import DEFAULT_AGENT, DEFAULT_REPO_ID, FILENAME_CONFIG, PROMPT_FILENAMES
-from .types import AgentConfig
+import enum
+import sys
+import types
+import typing
+import warnings
+from collections.abc import Callable, Sequence
 
 
-if TYPE_CHECKING:
-    from mcp import types as mcp_types
+# We use a UserWarning subclass, instead of DeprecationWarning, because CPython
+# decided deprecation warnings should be invisible by default.
+class CryptographyDeprecationWarning(UserWarning):
+    pass
 
 
-def format_result(result: "mcp_types.CallToolResult") -> str:
-    """
-    Formats a mcp.types.CallToolResult content into a human-readable string.
-
-    Args:
-        result (CallToolResult)
-            Object returned by mcp.ClientSession.call_tool.
-
-    Returns:
-        str
-            A formatted string representing the content of the result.
-    """
-    content = result.content
-
-    if len(content) == 0:
-        return "[No content]"
-
-    formatted_parts: list[str] = []
-
-    for item in content:
-        match item.type:
-            case "text":
-                formatted_parts.append(item.text)
-
-            case "image":
-                formatted_parts.append(
-                    f"[Binary Content: Image {item.mimeType}, {_get_base64_size(item.data)} bytes]\n"
-                    f"The task is complete and the content accessible to the User"
-                )
-
-            case "audio":
-                formatted_parts.append(
-                    f"[Binary Content: Audio {item.mimeType}, {_get_base64_size(item.data)} bytes]\n"
-                    f"The task is complete and the content accessible to the User"
-                )
-
-            case "resource":
-                resource = item.resource
-
-                if hasattr(resource, "text") and isinstance(resource.text, str):
-                    formatted_parts.append(resource.text)
-
-                elif hasattr(resource, "blob") and isinstance(resource.blob, str):
-                    formatted_parts.append(
-                        f"[Binary Content ({resource.uri}): {resource.mimeType},"
-                        f" {_get_base64_size(resource.blob)} bytes]\n"
-                        f"The task is complete and the content accessible to the User"
-                    )
-
-    return "\n".join(formatted_parts)
+# Several APIs were deprecated with no specific end-of-life date because of the
+# ubiquity of their use. They should not be removed until we agree on when that
+# cycle ends.
+DeprecatedIn36 = CryptographyDeprecationWarning
+DeprecatedIn40 = CryptographyDeprecationWarning
+DeprecatedIn41 = CryptographyDeprecationWarning
+DeprecatedIn42 = CryptographyDeprecationWarning
+DeprecatedIn43 = CryptographyDeprecationWarning
+DeprecatedIn47 = CryptographyDeprecationWarning
 
 
-def _get_base64_size(base64_str: str) -> int:
-    """Estimate the byte size of a base64-encoded string."""
-    # Remove any prefix like "data:image/png;base64,"
-    if "," in base64_str:
-        base64_str = base64_str.split(",")[1]
-
-    padding = 0
-    if base64_str.endswith("=="):
-        padding = 2
-    elif base64_str.endswith("="):
-        padding = 1
-
-    return (len(base64_str) * 3) // 4 - padding
+# If you're wondering why we don't use `Buffer`, it's because `Buffer` would
+# be more accurately named: Bufferable. It means something which has an
+# `__buffer__`. Which means you can't actually treat the result as a buffer
+# (and do things like take a `len()`).
+Buffer = typing.Union[bytes, bytearray, memoryview]
 
 
-def _load_agent_config(agent_path: Optional[str]) -> tuple[AgentConfig, Optional[str]]:
-    """Load server config and prompt."""
+def _check_bytes(name: str, value: bytes) -> None:
+    if not isinstance(value, bytes):
+        raise TypeError(f"{name} must be bytes")
 
-    def _read_dir(directory: Path) -> tuple[AgentConfig, Optional[str]]:
-        cfg_file = directory / FILENAME_CONFIG
-        if not cfg_file.exists():
-            raise FileNotFoundError(f" Config file not found in {directory}! Please make sure it exists locally")
 
-        config: AgentConfig = json.loads(cfg_file.read_text(encoding="utf-8"))
-        prompt: Optional[str] = None
-        for filename in PROMPT_FILENAMES:
-            prompt_file = directory / filename
-            if prompt_file.exists():
-                prompt = prompt_file.read_text(encoding="utf-8")
-                break
-        return config, prompt
-
-    if agent_path is None:
-        return DEFAULT_AGENT, None  # type: ignore
-
-    path = Path(agent_path).expanduser()
-
-    if path.is_file():
-        return json.loads(path.read_text(encoding="utf-8")), None
-
-    if path.is_dir():
-        return _read_dir(path)
-
-    # fetch from the Hub
+def _check_byteslike(name: str, value: Buffer) -> None:
     try:
-        repo_dir = Path(
-            snapshot_download(
-                repo_id=DEFAULT_REPO_ID,
-                allow_patterns=f"{agent_path}/*",
-                repo_type="dataset",
-            )
-        )
-        return _read_dir(repo_dir / agent_path)
-    except Exception as err:
-        raise EntryNotFoundError(
-            f" Agent {agent_path} not found in tiny-agents/tiny-agents! Please make sure it exists in https://huggingface.co/datasets/tiny-agents/tiny-agents."
-        ) from err
+        memoryview(value)
+    except TypeError:
+        raise TypeError(f"{name} must be bytes-like")
+
+
+def int_to_bytes(integer: int, length: int | None = None) -> bytes:
+    if length == 0:
+        raise ValueError("length argument can't be 0")
+    return integer.to_bytes(
+        length or (integer.bit_length() + 7) // 8 or 1, "big"
+    )
+
+
+class InterfaceNotImplemented(Exception):
+    pass
+
+
+class _DeprecatedValue:
+    def __init__(self, value: object, message: str, warning_class):
+        self.value = value
+        self.message = message
+        self.warning_class = warning_class
+
+
+class _ModuleWithDeprecations(types.ModuleType):
+    def __init__(self, module: types.ModuleType):
+        super().__init__(module.__name__)
+        self.__dict__["_module"] = module
+
+    def __getattr__(self, name: str) -> typing.Any:
+        obj = getattr(self._module, name)
+        if isinstance(obj, _DeprecatedValue):
+            warnings.warn(obj.message, obj.warning_class, stacklevel=2)
+            obj = obj.value
+        return obj
+
+    def __setattr__(self, attr: str, value: object) -> None:
+        setattr(self._module, attr, value)
+
+    def __delattr__(self, attr: str) -> None:
+        obj = getattr(self._module, attr)
+        if isinstance(obj, _DeprecatedValue):
+            warnings.warn(obj.message, obj.warning_class, stacklevel=2)
+
+        delattr(self._module, attr)
+
+    def __dir__(self) -> Sequence[str]:
+        return ["_module", *dir(self._module)]
+
+
+def deprecated(
+    value: object,
+    module_name: str,
+    message: str,
+    warning_class: type[Warning],
+    name: str | None = None,
+) -> _DeprecatedValue:
+    module = sys.modules[module_name]
+    if not isinstance(module, _ModuleWithDeprecations):
+        sys.modules[module_name] = module = _ModuleWithDeprecations(module)
+    dv = _DeprecatedValue(value, message, warning_class)
+    # Maintain backwards compatibility with `name is None` for pyOpenSSL.
+    if name is not None:
+        setattr(module, name, dv)
+    return dv
+
+
+def cached_property(func: Callable) -> property:
+    cached_name = f"_cached_{func}"
+    sentinel = object()
+
+    def inner(instance: object):
+        cache = getattr(instance, cached_name, sentinel)
+        if cache is not sentinel:
+            return cache
+        result = func(instance)
+        setattr(instance, cached_name, result)
+        return result
+
+    return property(inner)
+
+
+# Python 3.10 changed representation of enums. We use well-defined object
+# representation and string representation from Python 3.9.
+class Enum(enum.Enum):
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__}.{self._name_}: {self._value_!r}>"
+
+    def __str__(self) -> str:
+        return f"{self.__class__.__name__}.{self._name_}"
