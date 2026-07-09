@@ -1,4 +1,4 @@
 Wheel-Version: 1.0
-Generator: maturin (1.14.0)
-Root-Is-Purelib: false
-Tag: cp311-abi3-win_amd64
+Generator: pdm-backend (2.3.3)
+Root-Is-Purelib: true
+Tag: py3-none-any

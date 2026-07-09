@@ -6,64 +6,106 @@ from __future__ import annotations
 
 import abc
 
-from cryptography import utils
-from cryptography.hazmat.bindings._rust import (
-    ANSIX923PaddingContext,
-    ANSIX923UnpaddingContext,
-    PKCS7PaddingContext,
-    PKCS7UnpaddingContext,
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives._asymmetric import (
+    AsymmetricPadding as AsymmetricPadding,
 )
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 
-class PaddingContext(metaclass=abc.ABCMeta):
-    @abc.abstractmethod
-    def update(self, data: utils.Buffer) -> bytes:
-        """
-        Pads the provided bytes and returns any available data as bytes.
-        """
-
-    @abc.abstractmethod
-    def finalize(self) -> bytes:
-        """
-        Finalize the padding, returns bytes.
-        """
+class PKCS1v15(AsymmetricPadding):
+    name = "EMSA-PKCS1-v1_5"
 
 
-def _byte_padding_check(block_size: int) -> None:
-    if not (0 <= block_size <= 2040):
-        raise ValueError("block_size must be in range(0, 2041).")
-
-    if block_size % 8 != 0:
-        raise ValueError("block_size must be a multiple of 8.")
+class _MaxLength:
+    "Sentinel value for `MAX_LENGTH`."
 
 
-class PKCS7:
-    def __init__(self, block_size: int):
-        _byte_padding_check(block_size)
-        self.block_size = block_size
-
-    def padder(self) -> PaddingContext:
-        return PKCS7PaddingContext(self.block_size)
-
-    def unpadder(self) -> PaddingContext:
-        return PKCS7UnpaddingContext(self.block_size)
+class _Auto:
+    "Sentinel value for `AUTO`."
 
 
-PaddingContext.register(PKCS7PaddingContext)
-PaddingContext.register(PKCS7UnpaddingContext)
+class _DigestLength:
+    "Sentinel value for `DIGEST_LENGTH`."
 
 
-class ANSIX923:
-    def __init__(self, block_size: int):
-        _byte_padding_check(block_size)
-        self.block_size = block_size
+class PSS(AsymmetricPadding):
+    MAX_LENGTH = _MaxLength()
+    AUTO = _Auto()
+    DIGEST_LENGTH = _DigestLength()
+    name = "EMSA-PSS"
+    _salt_length: int | _MaxLength | _Auto | _DigestLength
 
-    def padder(self) -> PaddingContext:
-        return ANSIX923PaddingContext(self.block_size)
+    def __init__(
+        self,
+        mgf: MGF,
+        salt_length: int | _MaxLength | _Auto | _DigestLength,
+    ) -> None:
+        self._mgf = mgf
 
-    def unpadder(self) -> PaddingContext:
-        return ANSIX923UnpaddingContext(self.block_size)
+        if not isinstance(
+            salt_length, (int, _MaxLength, _Auto, _DigestLength)
+        ):
+            raise TypeError(
+                "salt_length must be an integer, MAX_LENGTH, "
+                "DIGEST_LENGTH, or AUTO"
+            )
+
+        if isinstance(salt_length, int) and salt_length < 0:
+            raise ValueError("salt_length must be zero or greater.")
+
+        self._salt_length = salt_length
+
+    @property
+    def mgf(self) -> MGF:
+        return self._mgf
 
 
-PaddingContext.register(ANSIX923PaddingContext)
-PaddingContext.register(ANSIX923UnpaddingContext)
+class OAEP(AsymmetricPadding):
+    name = "EME-OAEP"
+
+    def __init__(
+        self,
+        mgf: MGF,
+        algorithm: hashes.HashAlgorithm,
+        label: bytes | None,
+    ):
+        if not isinstance(algorithm, hashes.HashAlgorithm):
+            raise TypeError("Expected instance of hashes.HashAlgorithm.")
+
+        self._mgf = mgf
+        self._algorithm = algorithm
+        self._label = label
+
+    @property
+    def algorithm(self) -> hashes.HashAlgorithm:
+        return self._algorithm
+
+    @property
+    def mgf(self) -> MGF:
+        return self._mgf
+
+
+class MGF(metaclass=abc.ABCMeta):
+    _algorithm: hashes.HashAlgorithm
+
+
+class MGF1(MGF):
+    def __init__(self, algorithm: hashes.HashAlgorithm):
+        if not isinstance(algorithm, hashes.HashAlgorithm):
+            raise TypeError("Expected instance of hashes.HashAlgorithm.")
+
+        self._algorithm = algorithm
+
+
+def calculate_max_pss_salt_length(
+    key: rsa.RSAPrivateKey | rsa.RSAPublicKey,
+    hash_algorithm: hashes.HashAlgorithm,
+) -> int:
+    if not isinstance(key, (rsa.RSAPrivateKey, rsa.RSAPublicKey)):
+        raise TypeError("key must be an RSA public or private key")
+    # bit length - 1 per RFC 3447
+    emlen = (key.key_size + 6) // 8
+    salt_length = emlen - hash_algorithm.digest_size - 2
+    assert salt_length >= 0
+    return salt_length
