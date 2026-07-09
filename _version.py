@@ -1,4 +1,4 @@
-# File generated from our OpenAPI spec by Stainless. See CONTRIBUTING.md for details.
+# Master version for Pillow
+from __future__ import annotations
 
-__title__ = "anthropic"
-__version__ = "0.34.2"  # x-release-please-version
+__version__ = "12.3.0"
