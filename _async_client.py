@@ -12,33 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Related resources:
-#    https://huggingface.co/tasks
-#    https://huggingface.co/docs/huggingface.js/inference/README
-#    https://github.com/huggingface/huggingface.js/tree/main/packages/inference/src
-#    https://github.com/huggingface/text-generation-inference/tree/main/clients/python
-#    https://github.com/huggingface/text-generation-inference/blob/main/clients/python/text_generation/client.py
-#    https://huggingface.slack.com/archives/C03E4DQ9LAJ/p1680169099087869
-#    https://github.com/huggingface/unity-api#tasks
-#
-# Some TODO:
-# - add all tasks
-#
-# NOTE: the philosophy of this client is "let's make it as easy as possible to use it, even if less optimized". Some
-# examples of how it translates:
-# - Timeout / Server unavailable is handled by the client in a single "timeout" parameter.
-# - Files can be provided as bytes, file paths, or URLs and the client will try to "guess" the type.
-# - Images are parsed as PIL.Image for easier manipulation.
-# - Provides a "recommended model" for each task => suboptimal but user-wise quicker to get a first script running.
-# - Only the main parameters are publicly exposed. Power users can always read the docs for more options.
+# WARNING
+# This entire file has been adapted from the sync-client code in `src/huggingface_hub/inference/_client.py`.
+# Any change in InferenceClient will be automatically reflected in AsyncInferenceClient.
+# To re-generate the code, run `make style` or `python ./utils/generate_async_inference_client.py --update`.
+# WARNING
+import asyncio
 import base64
 import logging
 import os
 import re
 import warnings
-from collections.abc import Iterable
-from contextlib import ExitStack
-from typing import TYPE_CHECKING, Any, Literal, Optional, Union, overload
+from contextlib import AsyncExitStack
+from typing import TYPE_CHECKING, Any, AsyncIterable, Literal, Optional, Union, overload
+
+import httpx
 
 from huggingface_hub import constants
 from huggingface_hub.errors import BadRequestError, HfHubHTTPError, InferenceTimeoutError
@@ -46,6 +34,8 @@ from huggingface_hub.inference._common import (
     TASKS_EXPECTING_IMAGES,
     ContentT,
     RequestParameters,
+    _async_stream_chat_completion_response,
+    _async_stream_text_generation_response,
     _b64_encode,
     _b64_to_image,
     _bytes_to_dict,
@@ -54,8 +44,6 @@ from huggingface_hub.inference._common import (
     _get_unsupported_text_generation_kwargs,
     _import_numpy,
     _set_unsupported_text_generation_kwargs,
-    _stream_chat_completion_response,
-    _stream_text_generation_response,
     raise_text_generation_error,
 )
 from huggingface_hub.inference._generated.types import (
@@ -103,11 +91,13 @@ from huggingface_hub.inference._generated.types import (
 from huggingface_hub.inference._providers import PROVIDER_OR_POLICY_T, get_provider_helper
 from huggingface_hub.utils import (
     build_hf_headers,
-    get_session,
+    get_async_session,
     hf_raise_for_status,
     validate_hf_hub_args,
 )
 from huggingface_hub.utils._auth import get_token
+
+from .._common import _async_yield_from
 
 
 if TYPE_CHECKING:
@@ -120,7 +110,7 @@ logger = logging.getLogger(__name__)
 MODEL_KWARGS_NOT_USED_REGEX = re.compile(r"The following `model_kwargs` are not used by the model: \[(.*?)\]")
 
 
-class InferenceClient:
+class AsyncInferenceClient:
     """
     Initialize a new Inference Client.
 
@@ -235,57 +225,87 @@ class InferenceClient:
         self.cookies = cookies
         self.timeout = timeout
 
-        self.exit_stack = ExitStack()
+        self.exit_stack = AsyncExitStack()
+        self._async_client: Optional[httpx.AsyncClient] = None
 
     def __repr__(self):
         return f"<InferenceClient(model='{self.model if self.model else ''}', timeout={self.timeout})>"
 
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.exit_stack.close()
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        await self.close()
 
-    def close(self):
-        self.exit_stack.close()
+    async def close(self):
+        """Close the client.
+
+        This method is automatically called when using the client as a context manager.
+        """
+        await self.exit_stack.aclose()
+
+    async def _get_async_client(self):
+        """Get a unique async client for this AsyncInferenceClient instance.
+
+        Returns the same client instance on subsequent calls, ensuring proper
+        connection reuse and resource management through the exit stack.
+        """
+        if self._async_client is None:
+            self._async_client = await self.exit_stack.enter_async_context(get_async_session())
+        return self._async_client
 
     @overload
-    def _inner_post(  # type: ignore[misc]
+    async def _inner_post(  # type: ignore[misc]
         self, request_parameters: RequestParameters, *, stream: Literal[False] = ...
     ) -> bytes: ...
 
     @overload
-    def _inner_post(  # type: ignore[misc]
+    async def _inner_post(  # type: ignore[misc]
         self, request_parameters: RequestParameters, *, stream: Literal[True] = ...
-    ) -> Iterable[str]: ...
+    ) -> AsyncIterable[str]: ...
 
     @overload
-    def _inner_post(self, request_parameters: RequestParameters, *, stream: bool = False) -> bytes | Iterable[str]: ...
+    async def _inner_post(
+        self, request_parameters: RequestParameters, *, stream: bool = False
+    ) -> bytes | AsyncIterable[str]: ...
 
-    def _inner_post(self, request_parameters: RequestParameters, *, stream: bool = False) -> bytes | Iterable[str]:
+    async def _inner_post(
+        self, request_parameters: RequestParameters, *, stream: bool = False
+    ) -> bytes | AsyncIterable[str]:
         """Make a request to the inference server."""
+
         # TODO: this should be handled in provider helpers directly
         if request_parameters.task in TASKS_EXPECTING_IMAGES and "Accept" not in request_parameters.headers:
             request_parameters.headers["Accept"] = "image/png"
 
         try:
-            response = self.exit_stack.enter_context(
-                get_session().stream(
-                    "POST",
+            client = await self._get_async_client()
+            if stream:
+                response = await self.exit_stack.enter_async_context(
+                    client.stream(
+                        "POST",
+                        request_parameters.url,
+                        json=request_parameters.json,
+                        data=request_parameters.data,
+                        headers=request_parameters.headers,
+                        cookies=self.cookies,
+                        timeout=self.timeout,
+                    )
+                )
+                hf_raise_for_status(response)
+                return _async_yield_from(client, response)
+            else:
+                response = await client.post(
                     request_parameters.url,
                     json=request_parameters.json,
-                    content=request_parameters.data,
+                    data=request_parameters.data,
                     headers=request_parameters.headers,
                     cookies=self.cookies,
                     timeout=self.timeout,
                 )
-            )
-            hf_raise_for_status(response)
-            if stream:
-                return response.iter_lines()
-            else:
-                return response.read()
-        except TimeoutError as error:
+                hf_raise_for_status(response)
+                return response.content
+        except asyncio.TimeoutError as error:
             # Convert any `TimeoutError` to a `InferenceTimeoutError`
             raise InferenceTimeoutError(f"Inference call timed out: {request_parameters.url}") from error  # type: ignore
         except HfHubHTTPError as error:
@@ -296,7 +316,7 @@ class InferenceClient:
                 error.args = (msg,) + error.args[1:]
             raise
 
-    def audio_classification(
+    async def audio_classification(
         self,
         audio: ContentT,
         *,
@@ -331,9 +351,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.audio_classification("audio.flac")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.audio_classification("audio.flac")
         [
             AudioClassificationOutputElement(score=0.4976358711719513, label='hap'),
             AudioClassificationOutputElement(score=0.3677836060523987, label='neu'),
@@ -350,10 +371,10 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return AudioClassificationOutputElement.parse_obj_as_list(response)
 
-    def audio_to_audio(
+    async def audio_to_audio(
         self,
         audio: ContentT,
         *,
@@ -382,10 +403,11 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> audio_output = client.audio_to_audio("audio.flac")
-        >>> for i, item in enumerate(audio_output):
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> audio_output = await client.audio_to_audio("audio.flac")
+        >>> async for i, item in enumerate(audio_output):
         >>>     with open(f"output_{i}.flac", "wb") as f:
                     f.write(item.blob)
         ```
@@ -399,13 +421,13 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         audio_output = AudioToAudioOutputElement.parse_obj_as_list(response)
         for item in audio_output:
             item.blob = base64.b64decode(item.blob)
         return audio_output
 
-    def automatic_speech_recognition(
+    async def automatic_speech_recognition(
         self,
         audio: ContentT,
         *,
@@ -435,9 +457,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.automatic_speech_recognition("hello_world.flac").text
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.automatic_speech_recognition("hello_world.flac").text
         "hello world"
         ```
         """
@@ -450,12 +473,12 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         response = provider_helper.get_response(response, request_params=request_parameters)
         return AutomaticSpeechRecognitionOutput.parse_obj_as_instance(response)
 
     @overload
-    def chat_completion(  # type: ignore
+    async def chat_completion(  # type: ignore
         self,
         messages: list[dict | ChatCompletionInputMessage],
         *,
@@ -481,7 +504,7 @@ class InferenceClient:
     ) -> ChatCompletionOutput: ...
 
     @overload
-    def chat_completion(  # type: ignore
+    async def chat_completion(  # type: ignore
         self,
         messages: list[dict | ChatCompletionInputMessage],
         *,
@@ -504,10 +527,10 @@ class InferenceClient:
         top_logprobs: int | None = None,
         top_p: float | None = None,
         extra_body: dict | None = None,
-    ) -> Iterable[ChatCompletionStreamOutput]: ...
+    ) -> AsyncIterable[ChatCompletionStreamOutput]: ...
 
     @overload
-    def chat_completion(
+    async def chat_completion(
         self,
         messages: list[dict | ChatCompletionInputMessage],
         *,
@@ -530,9 +553,9 @@ class InferenceClient:
         top_logprobs: int | None = None,
         top_p: float | None = None,
         extra_body: dict | None = None,
-    ) -> ChatCompletionOutput | Iterable[ChatCompletionStreamOutput]: ...
+    ) -> ChatCompletionOutput | AsyncIterable[ChatCompletionStreamOutput]: ...
 
-    def chat_completion(
+    async def chat_completion(
         self,
         messages: list[dict | ChatCompletionInputMessage],
         *,
@@ -556,7 +579,7 @@ class InferenceClient:
         top_logprobs: int | None = None,
         top_p: float | None = None,
         extra_body: dict | None = None,
-    ) -> ChatCompletionOutput | Iterable[ChatCompletionStreamOutput]:
+    ) -> ChatCompletionOutput | AsyncIterable[ChatCompletionStreamOutput]:
         """
         A method for completing conversations using a specified language model.
 
@@ -639,10 +662,11 @@ class InferenceClient:
         Example:
 
         ```py
-        >>> from huggingface_hub import InferenceClient
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
         >>> messages = [{"role": "user", "content": "What is the capital of France?"}]
-        >>> client = InferenceClient("meta-llama/Meta-Llama-3-8B-Instruct")
-        >>> client.chat_completion(messages, max_tokens=100)
+        >>> client = AsyncInferenceClient("meta-llama/Meta-Llama-3-8B-Instruct")
+        >>> await client.chat_completion(messages, max_tokens=100)
         ChatCompletionOutput(
             choices=[
                 ChatCompletionOutputComplete(
@@ -672,10 +696,11 @@ class InferenceClient:
 
         Example using streaming:
         ```py
-        >>> from huggingface_hub import InferenceClient
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
         >>> messages = [{"role": "user", "content": "What is the capital of France?"}]
-        >>> client = InferenceClient("meta-llama/Meta-Llama-3-8B-Instruct")
-        >>> for token in client.chat_completion(messages, max_tokens=10, stream=True):
+        >>> client = AsyncInferenceClient("meta-llama/Meta-Llama-3-8B-Instruct")
+        >>> async for token in await client.chat_completion(messages, max_tokens=10, stream=True):
         ...     print(token)
         ChatCompletionStreamOutput(choices=[ChatCompletionStreamOutputChoice(delta=ChatCompletionStreamOutputDelta(content='The', role='assistant'), index=0, finish_reason=None)], created=1710498504)
         ChatCompletionStreamOutput(choices=[ChatCompletionStreamOutputChoice(delta=ChatCompletionStreamOutputDelta(content=' capital', role='assistant'), index=0, finish_reason=None)], created=1710498504)
@@ -685,16 +710,17 @@ class InferenceClient:
 
         Example using OpenAI's syntax:
         ```py
+        # Must be run in an async context
         # instead of `from openai import OpenAI`
-        from huggingface_hub import InferenceClient
+        from huggingface_hub import AsyncInferenceClient
 
         # instead of `client = OpenAI(...)`
-        client = InferenceClient(
+        client = AsyncInferenceClient(
             base_url=...,
             api_key=...,
         )
 
-        output = client.chat.completions.create(
+        output = await client.chat.completions.create(
             model="meta-llama/Meta-Llama-3-8B-Instruct",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
@@ -737,7 +763,8 @@ class InferenceClient:
 
         Example using Image + Text as input:
         ```py
-        >>> from huggingface_hub import InferenceClient
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
 
         # provide a remote URL
         >>> image_url ="https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg"
@@ -747,8 +774,8 @@ class InferenceClient:
         ...     base64_image = base64.b64encode(f.read()).decode("utf-8")
         >>> image_url = f"data:image/jpeg;base64,{base64_image}"
 
-        >>> client = InferenceClient("meta-llama/Llama-3.2-11B-Vision-Instruct")
-        >>> output = client.chat.completions.create(
+        >>> client = AsyncInferenceClient("meta-llama/Llama-3.2-11B-Vision-Instruct")
+        >>> output = await client.chat.completions.create(
         ...     messages=[
         ...         {
         ...             "role": "user",
@@ -771,7 +798,8 @@ class InferenceClient:
 
         Example using tools:
         ```py
-        >>> client = InferenceClient("meta-llama/Meta-Llama-3-70B-Instruct")
+        # Must be run in an async context
+        >>> client = AsyncInferenceClient("meta-llama/Meta-Llama-3-70B-Instruct")
         >>> messages = [
         ...     {
         ...         "role": "system",
@@ -833,7 +861,7 @@ class InferenceClient:
         ...     },
         ... ]
 
-        >>> response = client.chat_completion(
+        >>> response = await client.chat_completion(
         ...     model="meta-llama/Meta-Llama-3-70B-Instruct",
         ...     messages=messages,
         ...     tools=tools,
@@ -854,8 +882,9 @@ class InferenceClient:
 
         Example using response_format:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient("meta-llama/Meta-Llama-3-70B-Instruct")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient("meta-llama/Meta-Llama-3-70B-Instruct")
         >>> messages = [
         ...     {
         ...         "role": "user",
@@ -874,7 +903,7 @@ class InferenceClient:
         ...         "required": ["location", "activity", "animals_seen", "animals"],
         ...     },
         ... }
-        >>> response = client.chat_completion(
+        >>> response = await client.chat_completion(
         ...     messages=messages,
         ...     response_format=response_format,
         ...     max_tokens=500,
@@ -927,14 +956,14 @@ class InferenceClient:
             model=model_id_or_url,
             api_key=self.token,
         )
-        data = self._inner_post(request_parameters, stream=stream)
+        data = await self._inner_post(request_parameters, stream=stream)
 
         if stream:
-            return _stream_chat_completion_response(data)  # type: ignore
+            return _async_stream_chat_completion_response(data)  # type: ignore
 
         return ChatCompletionOutput.parse_obj_as_instance(data)  # type: ignore
 
-    def document_question_answering(
+    async def document_question_answering(
         self,
         image: ContentT,
         question: str,
@@ -993,9 +1022,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.document_question_answering(image="https://huggingface.co/spaces/impira/docquery/resolve/2359223c1837a7587402bda0f2643382a6eefeab/invoice.png", question="What is the invoice number?")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.document_question_answering(image="https://huggingface.co/spaces/impira/docquery/resolve/2359223c1837a7587402bda0f2643382a6eefeab/invoice.png", question="What is the invoice number?")
         [DocumentQuestionAnsweringOutputElement(answer='us-001', end=16, score=0.9999666213989258, start=16)]
         ```
         """
@@ -1018,10 +1048,10 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return DocumentQuestionAnsweringOutputElement.parse_obj_as_list(response)
 
-    def feature_extraction(
+    async def feature_extraction(
         self,
         text: str | list[str],
         *,
@@ -1075,9 +1105,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.feature_extraction("Hi, who are you?")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.feature_extraction("Hi, who are you?")
         array([[ 2.424802  ,  2.93384   ,  1.1750331 , ...,  1.240499, -0.13776633, -0.7889173 ],
         [-0.42943227, -0.6364878 , -1.693462  , ...,  0.41978157, -2.4336355 ,  0.6162071 ],
         ...,
@@ -1100,11 +1131,11 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         np = _import_numpy()
         return np.array(provider_helper.get_response(response), dtype="float32")
 
-    def fill_mask(
+    async def fill_mask(
         self,
         text: str,
         *,
@@ -1139,9 +1170,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.fill_mask("The goal of life is <mask>.")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.fill_mask("The goal of life is <mask>.")
         [
             FillMaskOutputElement(score=0.06897063553333282, token=11098, token_str=' happiness', sequence='The goal of life is happiness.'),
             FillMaskOutputElement(score=0.06554922461509705, token=45075, token_str=' immortality', sequence='The goal of life is immortality.')
@@ -1157,10 +1189,10 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return FillMaskOutputElement.parse_obj_as_list(response)
 
-    def image_classification(
+    async def image_classification(
         self,
         image: ContentT,
         *,
@@ -1192,9 +1224,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.image_classification("https://upload.wikimedia.org/wikipedia/commons/thumb/4/43/Cute_dog.jpg/320px-Cute_dog.jpg")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.image_classification("https://upload.wikimedia.org/wikipedia/commons/thumb/4/43/Cute_dog.jpg/320px-Cute_dog.jpg")
         [ImageClassificationOutputElement(label='Blenheim spaniel', score=0.9779096841812134), ...]
         ```
         """
@@ -1207,10 +1240,10 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return ImageClassificationOutputElement.parse_obj_as_list(response)
 
-    def image_segmentation(
+    async def image_segmentation(
         self,
         image: ContentT,
         *,
@@ -1251,9 +1284,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.image_segmentation("cat.jpg")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.image_segmentation("cat.jpg")
         [ImageSegmentationOutputElement(score=0.989008, label='LABEL_184', mask=<PIL.PngImagePlugin.PngImageFile image mode=L size=400x300 at 0x7FDD2B129CC0>), ...]
         ```
         """
@@ -1271,14 +1305,14 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         response = provider_helper.get_response(response, request_parameters)
         output = ImageSegmentationOutputElement.parse_obj_as_list(response)
         for item in output:
             item.mask = _b64_to_image(item.mask)  # type: ignore
         return output
 
-    def image_to_image(
+    async def image_to_image(
         self,
         image: ContentT,
         prompt: str | None = None,
@@ -1327,9 +1361,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> image = client.image_to_image("cat.jpg", prompt="turn the cat into a tiger")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> image = await client.image_to_image("cat.jpg", prompt="turn the cat into a tiger")
         >>> image.save("tiger.jpg")
         ```
 
@@ -1350,11 +1385,11 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         response = provider_helper.get_response(response, request_parameters)
         return _bytes_to_image(response)
 
-    def image_to_video(
+    async def image_to_video(
         self,
         image: ContentT,
         *,
@@ -1404,9 +1439,10 @@ class InferenceClient:
 
         Examples:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> video = client.image_to_video("cat.jpg", model="Wan-AI/Wan2.2-I2V-A14B", prompt="turn the cat into a tiger")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> video = await client.image_to_video("cat.jpg", model="Wan-AI/Wan2.2-I2V-A14B", prompt="turn the cat into a tiger")
         >>> with open("tiger.mp4", "wb") as f:
         ...     f.write(video)
         ```
@@ -1429,11 +1465,11 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         response = provider_helper.get_response(response, request_parameters)
         return response
 
-    def image_to_text(self, image: ContentT, *, model: str | None = None) -> ImageToTextOutput:
+    async def image_to_text(self, image: ContentT, *, model: str | None = None) -> ImageToTextOutput:
         """
         Takes an input image and return text.
 
@@ -1458,11 +1494,12 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.image_to_text("cat.jpg")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.image_to_text("cat.jpg")
         'a cat standing in a grassy field '
-        >>> client.image_to_text("https://upload.wikimedia.org/wikipedia/commons/thumb/4/43/Cute_dog.jpg/320px-Cute_dog.jpg")
+        >>> await client.image_to_text("https://upload.wikimedia.org/wikipedia/commons/thumb/4/43/Cute_dog.jpg/320px-Cute_dog.jpg")
         'a dog laying on the grass next to a flower pot '
         ```
         """
@@ -1475,11 +1512,11 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         output_list: list[ImageToTextOutput] = ImageToTextOutput.parse_obj_as_list(response)
         return output_list[0]
 
-    def object_detection(
+    async def object_detection(
         self, image: ContentT, *, model: str | None = None, threshold: float | None = None
     ) -> list[ObjectDetectionOutputElement]:
         """
@@ -1509,9 +1546,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.object_detection("people.jpg")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.object_detection("people.jpg")
         [ObjectDetectionOutputElement(score=0.9486683011054993, label='person', box=ObjectDetectionBoundingBox(xmin=59, ymin=39, xmax=420, ymax=510)), ...]
         ```
         """
@@ -1524,10 +1562,10 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return ObjectDetectionOutputElement.parse_obj_as_list(response)
 
-    def question_answering(
+    async def question_answering(
         self,
         question: str,
         context: str,
@@ -1583,9 +1621,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.question_answering(question="What's my name?", context="My name is Clara and I live in Berkeley.")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.question_answering(question="What's my name?", context="My name is Clara and I live in Berkeley.")
         QuestionAnsweringOutputElement(answer='Clara', end=16, score=0.9326565265655518, start=11)
         ```
         """
@@ -1606,12 +1645,12 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         # Parse the response as a single `QuestionAnsweringOutputElement` when top_k is 1 or not provided, or a list of `QuestionAnsweringOutputElement` to ensure backward compatibility.
         output = QuestionAnsweringOutputElement.parse_obj(response)
         return output
 
-    def sentence_similarity(
+    async def sentence_similarity(
         self, sentence: str, other_sentences: list[str], *, model: str | None = None
     ) -> list[float]:
         """
@@ -1638,9 +1677,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.sentence_similarity(
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.sentence_similarity(
         ...     "Machine learning is so easy.",
         ...     other_sentences=[
         ...         "Deep learning is so straightforward.",
@@ -1661,10 +1701,10 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return _bytes_to_list(response)
 
-    def summarization(
+    async def summarization(
         self,
         text: str,
         *,
@@ -1699,9 +1739,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.summarization("The Eiffel tower...")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.summarization("The Eiffel tower...")
         SummarizationOutput(generated_text="The Eiffel tower is one of the most famous landmarks in the world....")
         ```
         """
@@ -1719,10 +1760,10 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return SummarizationOutput.parse_obj_as_list(response)[0]
 
-    def table_question_answering(
+    async def table_question_answering(
         self,
         table: dict[str, Any],
         query: str,
@@ -1764,11 +1805,12 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
         >>> query = "How many stars does the transformers repository have?"
         >>> table = {"Repository": ["Transformers", "Datasets", "Tokenizers"], "Stars": ["36542", "4512", "3934"]}
-        >>> client.table_question_answering(table, query, model="google/tapas-base-finetuned-wtq")
+        >>> await client.table_question_answering(table, query, model="google/tapas-base-finetuned-wtq")
         TableQuestionAnsweringOutputElement(answer='36542', coordinates=[[0, 1]], cells=['36542'], aggregator='AVERAGE')
         ```
         """
@@ -1781,10 +1823,10 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return TableQuestionAnsweringOutputElement.parse_obj_as_instance(response)
 
-    def tabular_classification(self, table: dict[str, Any], *, model: str | None = None) -> list[str]:
+    async def tabular_classification(self, table: dict[str, Any], *, model: str | None = None) -> list[str]:
         """
         Classifying a target category (a group) based on a set of attributes.
 
@@ -1807,8 +1849,9 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
         >>> table = {
         ...     "fixed_acidity": ["7.4", "7.8", "10.3"],
         ...     "volatile_acidity": ["0.7", "0.88", "0.32"],
@@ -1822,7 +1865,7 @@ class InferenceClient:
         ...     "sulphates": ["0.56", "0.68", "0.82"],
         ...     "alcohol": ["9.4", "9.8", "12.6"],
         ... }
-        >>> client.tabular_classification(table=table, model="julien-c/wine-quality")
+        >>> await client.tabular_classification(table=table, model="julien-c/wine-quality")
         ["5", "5", "5"]
         ```
         """
@@ -1836,10 +1879,10 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return _bytes_to_list(response)
 
-    def tabular_regression(self, table: dict[str, Any], *, model: str | None = None) -> list[float]:
+    async def tabular_regression(self, table: dict[str, Any], *, model: str | None = None) -> list[float]:
         """
         Predicting a numerical target value given a set of attributes/features in a table.
 
@@ -1862,8 +1905,9 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
         >>> table = {
         ...     "Height": ["11.52", "12.48", "12.3778"],
         ...     "Length1": ["23.2", "24", "23.9"],
@@ -1872,7 +1916,7 @@ class InferenceClient:
         ...     "Species": ["Bream", "Bream", "Bream"],
         ...     "Width": ["4.02", "4.3056", "4.6961"],
         ... }
-        >>> client.tabular_regression(table, model="scikit-learn/Fish-Weight")
+        >>> await client.tabular_regression(table, model="scikit-learn/Fish-Weight")
         [110, 120, 130]
         ```
         """
@@ -1886,10 +1930,10 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return _bytes_to_list(response)
 
-    def text_classification(
+    async def text_classification(
         self,
         text: str,
         *,
@@ -1923,9 +1967,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.text_classification("I like you")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.text_classification("I like you")
         [
             TextClassificationOutputElement(label='POSITIVE', score=0.9998695850372314),
             TextClassificationOutputElement(label='NEGATIVE', score=0.0001304351753788069),
@@ -1944,11 +1989,11 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return TextClassificationOutputElement.parse_obj_as_list(response)[0]  # type: ignore
 
     @overload
-    def text_generation(
+    async def text_generation(
         self,
         prompt: str,
         *,
@@ -1975,10 +2020,10 @@ class InferenceClient:
         truncate: int | None = None,
         typical_p: float | None = None,
         watermark: bool | None = None,
-    ) -> Iterable[TextGenerationStreamOutput]: ...
+    ) -> AsyncIterable[TextGenerationStreamOutput]: ...
 
     @overload
-    def text_generation(
+    async def text_generation(
         self,
         prompt: str,
         *,
@@ -2008,7 +2053,7 @@ class InferenceClient:
     ) -> TextGenerationOutput: ...
 
     @overload
-    def text_generation(
+    async def text_generation(
         self,
         prompt: str,
         *,
@@ -2035,10 +2080,10 @@ class InferenceClient:
         truncate: int | None = None,
         typical_p: float | None = None,
         watermark: bool | None = None,
-    ) -> Iterable[str]: ...
+    ) -> AsyncIterable[str]: ...
 
     @overload
-    def text_generation(
+    async def text_generation(
         self,
         prompt: str,
         *,
@@ -2068,7 +2113,7 @@ class InferenceClient:
     ) -> str: ...
 
     @overload
-    def text_generation(
+    async def text_generation(
         self,
         prompt: str,
         *,
@@ -2095,9 +2140,9 @@ class InferenceClient:
         truncate: int | None = None,
         typical_p: float | None = None,
         watermark: bool | None = None,
-    ) -> str | TextGenerationOutput | Iterable[str] | Iterable[TextGenerationStreamOutput]: ...
+    ) -> str | TextGenerationOutput | AsyncIterable[str] | AsyncIterable[TextGenerationStreamOutput]: ...
 
-    def text_generation(
+    async def text_generation(
         self,
         prompt: str,
         *,
@@ -2124,7 +2169,7 @@ class InferenceClient:
         truncate: int | None = None,
         typical_p: float | None = None,
         watermark: bool | None = None,
-    ) -> str | TextGenerationOutput | Iterable[str] | Iterable[TextGenerationStreamOutput]:
+    ) -> str | TextGenerationOutput | AsyncIterable[str] | AsyncIterable[TextGenerationStreamOutput]:
         """
         Given a prompt, generate the following text.
 
@@ -2192,10 +2237,10 @@ class InferenceClient:
                 Watermarking with [A Watermark for Large Language Models](https://arxiv.org/abs/2301.10226)
 
         Returns:
-            `Union[str, TextGenerationOutput, Iterable[str], Iterable[TextGenerationStreamOutput]]`:
+            `Union[str, TextGenerationOutput, AsyncIterable[str], AsyncIterable[TextGenerationStreamOutput]]`:
             Generated text returned from the server:
             - if `stream=False` and `details=False`, the generated text is returned as a `str` (default)
-            - if `stream=True` and `details=False`, the generated text is returned token by token as a `Iterable[str]`
+            - if `stream=True` and `details=False`, the generated text is returned token by token as a `AsyncIterable[str]`
             - if `stream=False` and `details=True`, the generated text is returned with more details as a [`~huggingface_hub.TextGenerationOutput`]
             - if `details=True` and `stream=True`, the generated text is returned token by token as a iterable of [`~huggingface_hub.TextGenerationStreamOutput`]
 
@@ -2209,15 +2254,16 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
 
         # Case 1: generate text
-        >>> client.text_generation("The huggingface_hub library is ", max_new_tokens=12)
+        >>> await client.text_generation("The huggingface_hub library is ", max_new_tokens=12)
         '100% open source and built to be easy to use.'
 
         # Case 2: iterate over the generated tokens. Useful for large generation.
-        >>> for token in client.text_generation("The huggingface_hub library is ", max_new_tokens=12, stream=True):
+        >>> async for token in await client.text_generation("The huggingface_hub library is ", max_new_tokens=12, stream=True):
         ...     print(token)
         100
         %
@@ -2233,7 +2279,7 @@ class InferenceClient:
         .
 
         # Case 3: get more details about the generation process.
-        >>> client.text_generation("The huggingface_hub library is ", max_new_tokens=12, details=True)
+        >>> await client.text_generation("The huggingface_hub library is ", max_new_tokens=12, details=True)
         TextGenerationOutput(
             generated_text='100% open source and built to be easy to use.',
             details=TextGenerationDetails(
@@ -2258,7 +2304,7 @@ class InferenceClient:
 
         # Case 4: iterate over the generated tokens with more details.
         # Last object is more complete, containing the full generated text and the finish reason.
-        >>> for details in client.text_generation("The huggingface_hub library is ", max_new_tokens=12, details=True, stream=True):
+        >>> async for details in await client.text_generation("The huggingface_hub library is ", max_new_tokens=12, details=True, stream=True):
         ...     print(details)
         ...
         TextGenerationStreamOutput(token=TokenElement(id=1425, text='100', logprob=-1.0175781, special=False), generated_text=None, details=None)
@@ -2282,7 +2328,7 @@ class InferenceClient:
         )
 
         # Case 5: generate constrained output using grammar
-        >>> response = client.text_generation(
+        >>> response = await client.text_generation(
         ...     prompt="I saw a puppy a cat and a raccoon during my bike ride in the park",
         ...     model="HuggingFaceH4/zephyr-orpo-141b-A35b-v0.1",
         ...     max_new_tokens=100,
@@ -2392,13 +2438,13 @@ class InferenceClient:
 
         # Handle errors separately for more precise error messages
         try:
-            bytes_output = self._inner_post(request_parameters, stream=stream or False)
+            bytes_output = await self._inner_post(request_parameters, stream=stream or False)
         except HfHubHTTPError as e:
             match = MODEL_KWARGS_NOT_USED_REGEX.search(str(e))
             if isinstance(e, BadRequestError) and match:
                 unused_params = [kwarg.strip("' ") for kwarg in match.group(1).split(",")]
                 _set_unsupported_text_generation_kwargs(model, unused_params)
-                return self.text_generation(  # type: ignore
+                return await self.text_generation(  # type: ignore
                     prompt=prompt,
                     details=details,
                     stream=stream,
@@ -2426,7 +2472,7 @@ class InferenceClient:
 
         # Parse output
         if stream:
-            return _stream_text_generation_response(bytes_output, details)  # type: ignore
+            return _async_stream_text_generation_response(bytes_output, details)  # type: ignore
 
         data = _bytes_to_dict(bytes_output)  # type: ignore
 
@@ -2436,7 +2482,7 @@ class InferenceClient:
         response = provider_helper.get_response(data, request_parameters)
         return TextGenerationOutput.parse_obj_as_instance(response) if details else response["generated_text"]
 
-    def text_to_image(
+    async def text_to_image(
         self,
         prompt: str,
         *,
@@ -2497,13 +2543,14 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
 
-        >>> image = client.text_to_image("An astronaut riding a horse on the moon.")
+        >>> image = await client.text_to_image("An astronaut riding a horse on the moon.")
         >>> image.save("astronaut.png")
 
-        >>> image = client.text_to_image(
+        >>> image = await client.text_to_image(
         ...     "An astronaut riding a horse on the moon.",
         ...     negative_prompt="low resolution, blurry",
         ...     model="stabilityai/stable-diffusion-2-1",
@@ -2572,11 +2619,11 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         response = provider_helper.get_response(response, request_parameters)
         return _bytes_to_image(response)
 
-    def text_to_video(
+    async def text_to_video(
         self,
         prompt: str,
         *,
@@ -2669,11 +2716,11 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         response = provider_helper.get_response(response, request_parameters)
         return response
 
-    def text_to_speech(
+    async def text_to_speech(
         self,
         text: str,
         *,
@@ -2769,11 +2816,12 @@ class InferenceClient:
 
         Example:
         ```py
+        # Must be run in an async context
         >>> from pathlib import Path
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
 
-        >>> audio = client.text_to_speech("Hello world")
+        >>> audio = await client.text_to_speech("Hello world")
         >>> Path("hello_world.flac").write_bytes(audio)
         ```
 
@@ -2877,11 +2925,11 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         response = provider_helper.get_response(response)
         return response
 
-    def token_classification(
+    async def token_classification(
         self,
         text: str,
         *,
@@ -2919,9 +2967,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.token_classification("My name is Sarah Jessica Parker but you can call me Jessica")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.token_classification("My name is Sarah Jessica Parker but you can call me Jessica")
         [
             TokenClassificationOutputElement(
                 entity_group='PER',
@@ -2953,10 +3002,10 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return TokenClassificationOutputElement.parse_obj_as_list(response)
 
-    def translation(
+    async def translation(
         self,
         text: str,
         *,
@@ -3006,11 +3055,12 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.translation("My name is Wolfgang and I live in Berlin")
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.translation("My name is Wolfgang and I live in Berlin")
         'Mein Name ist Wolfgang und ich lebe in Berlin.'
-        >>> client.translation("My name is Wolfgang and I live in Berlin", model="Helsinki-NLP/opus-mt-en-fr")
+        >>> await client.translation("My name is Wolfgang and I live in Berlin", model="Helsinki-NLP/opus-mt-en-fr")
         TranslationOutput(translation_text='Je m'appelle Wolfgang et je vis à Berlin.')
         ```
 
@@ -3042,10 +3092,10 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return TranslationOutput.parse_obj_as_list(response)[0]
 
-    def visual_question_answering(
+    async def visual_question_answering(
         self,
         image: ContentT,
         question: str,
@@ -3079,9 +3129,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.visual_question_answering(
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.visual_question_answering(
         ...     image="https://huggingface.co/datasets/mishig/sample_images/resolve/main/tiger.jpg",
         ...     question="What is the animal doing?"
         ... )
@@ -3101,10 +3152,10 @@ class InferenceClient:
             api_key=self.token,
             extra_payload={"question": question, "image": _b64_encode(image)},
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return VisualQuestionAnsweringOutputElement.parse_obj_as_list(response)
 
-    def zero_shot_classification(
+    async def zero_shot_classification(
         self,
         text: str,
         candidate_labels: list[str],
@@ -3146,15 +3197,16 @@ class InferenceClient:
 
         Example with `multi_label=False`:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
         >>> text = (
         ...     "A new model offers an explanation for how the Galilean satellites formed around the solar system's"
         ...     "largest world. Konstantin Batygin did not set out to solve one of the solar system's most puzzling"
         ...     " mysteries when he went for a run up a hill in Nice, France."
         ... )
         >>> labels = ["space & cosmos", "scientific discovery", "microbiology", "robots", "archeology"]
-        >>> client.zero_shot_classification(text, labels)
+        >>> await client.zero_shot_classification(text, labels)
         [
             ZeroShotClassificationOutputElement(label='scientific discovery', score=0.7961668968200684),
             ZeroShotClassificationOutputElement(label='space & cosmos', score=0.18570658564567566),
@@ -3162,7 +3214,7 @@ class InferenceClient:
             ZeroShotClassificationOutputElement(label='archeology', score=0.006258360575884581),
             ZeroShotClassificationOutputElement(label='robots', score=0.004559356719255447),
         ]
-        >>> client.zero_shot_classification(text, labels, multi_label=True)
+        >>> await client.zero_shot_classification(text, labels, multi_label=True)
         [
             ZeroShotClassificationOutputElement(label='scientific discovery', score=0.9829297661781311),
             ZeroShotClassificationOutputElement(label='space & cosmos', score=0.755190908908844),
@@ -3174,9 +3226,10 @@ class InferenceClient:
 
         Example with `multi_label=True` and a custom `hypothesis_template`:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
-        >>> client.zero_shot_classification(
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
+        >>> await client.zero_shot_classification(
         ...    text="I really like our dinner and I'm very happy. I don't like the weather though.",
         ...    labels=["positive", "negative", "pessimistic", "optimistic"],
         ...    multi_label=True,
@@ -3203,11 +3256,11 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         output = _bytes_to_dict(response)
         return ZeroShotClassificationOutputElement.parse_obj_as_list(output)
 
-    def zero_shot_image_classification(
+    async def zero_shot_image_classification(
         self,
         image: ContentT,
         candidate_labels: list[str],
@@ -3245,10 +3298,11 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient()
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient()
 
-        >>> client.zero_shot_image_classification(
+        >>> await client.zero_shot_image_classification(
         ...     "https://upload.wikimedia.org/wikipedia/commons/thumb/4/43/Cute_dog.jpg/320px-Cute_dog.jpg",
         ...     labels=["dog", "cat", "horse"],
         ... )
@@ -3271,10 +3325,10 @@ class InferenceClient:
             model=model_id,
             api_key=self.token,
         )
-        response = self._inner_post(request_parameters)
+        response = await self._inner_post(request_parameters)
         return ZeroShotImageClassificationOutputElement.parse_obj_as_list(response)
 
-    def get_endpoint_info(self, *, model: str | None = None) -> dict[str, Any]:
+    async def get_endpoint_info(self, *, model: str | None = None) -> dict[str, Any]:
         """
         Get information about the deployed endpoint.
 
@@ -3291,9 +3345,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient("meta-llama/Meta-Llama-3-70B-Instruct")
-        >>> client.get_endpoint_info()
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient("meta-llama/Meta-Llama-3-70B-Instruct")
+        >>> await client.get_endpoint_info()
         {
             'model_id': 'meta-llama/Meta-Llama-3-70B-Instruct',
             'model_sha': None,
@@ -3328,11 +3383,12 @@ class InferenceClient:
         else:
             url = f"{constants.INFERENCE_ENDPOINT}/models/{model}/info"
 
-        response = get_session().get(url, headers=build_hf_headers(token=self.token))
+        client = await self._get_async_client()
+        response = await client.get(url, headers=build_hf_headers(token=self.token))
         hf_raise_for_status(response)
         return response.json()
 
-    def health_check(self, model: str | None = None) -> bool:
+    async def health_check(self, model: str | None = None) -> bool:
         """
         Check the health of the deployed endpoint.
 
@@ -3347,9 +3403,10 @@ class InferenceClient:
 
         Example:
         ```py
-        >>> from huggingface_hub import InferenceClient
-        >>> client = InferenceClient("https://jzgu0buei5.us-east-1.aws.endpoints.huggingface.cloud")
-        >>> client.health_check()
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient("https://jzgu0buei5.us-east-1.aws.endpoints.huggingface.cloud")
+        >>> await client.health_check()
         True
         ```
         """
@@ -3363,7 +3420,8 @@ class InferenceClient:
             raise ValueError("Model must be an Inference Endpoint URL.")
         url = model.rstrip("/") + "/health"
 
-        response = get_session().get(url, headers=build_hf_headers(token=self.token))
+        client = await self._get_async_client()
+        response = await client.get(url, headers=build_hf_headers(token=self.token))
         return response.status_code == 200
 
     @property
@@ -3374,7 +3432,7 @@ class InferenceClient:
 class _ProxyClient:
     """Proxy class to be able to call `client.chat.completion.create(...)` as OpenAI client."""
 
-    def __init__(self, client: InferenceClient):
+    def __init__(self, client: AsyncInferenceClient):
         self._client = client
 
 
